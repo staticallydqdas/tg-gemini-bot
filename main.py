@@ -22,7 +22,7 @@ async def inline_query_handler(query: types.InlineQuery):
     try:
         # Запрашиваем ответ у Gemini
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=text
         )
         answer = response.text or "Ответ не сформирован."
