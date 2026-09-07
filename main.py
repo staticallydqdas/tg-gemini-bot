@@ -60,10 +60,10 @@ async def inline_handler(query: types.InlineQuery):
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     escaped_q = html.escape(text)
 
-    # Важно: кнопка-заглушка с callback_data, которая заставляет Telegram привязать inline_message_id
+    # Кнопка для прямого триггера обновления
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ Генерируется ответ...", callback_data="wait")]
+            [InlineKeyboardButton(text="⚡ Получить ответ нейросети", callback_data=f"ask:{q_id[:20]}")]
         ]
     )
 
@@ -72,43 +72,70 @@ async def inline_handler(query: types.InlineQuery):
         title="✨ Спросить нейросеть:",
         description=text[:60],
         input_message_content=InputTextMessageContent(
-            message_text=f"❓ <b>{escaped_q}</b>\n\n<i>⏳ Нейросеть генерирует ответ...</i>",
+            message_text=f"❓ <b>{escaped_q}</b>\n\n<i>Нажмите кнопку ниже, чтобы сгенерировать ответ:</i>",
             parse_mode="HTML",
         ),
         reply_markup=kb,
     )
     await query.answer([item], cache_time=1, is_personal=True)
 
-# Игнорируем нажатия на кнопку-заглушку, пока думает
-@dp.callback_query()
-async def callback_handler(callback: types.CallbackQuery):
-    await callback.answer()
+# Обработка нажатия на кнопку под сообщением
+@dp.callback_query(lambda c: c.data and c.data.startswith("ask:"))
+async def on_button_click(callback: types.CallbackQuery):
+    await callback.answer("⏳ Генерирую ответ...")
+    
+    # Получаем исходный текст вопроса из тела сообщения
+    full_text = callback.message.text if callback.message else ""
+    if not full_text and callback.inline_message_id:
+        # Для инлайн-сообщений исходный текст берем из сообщения
+        print("Получен инлайн-клик на кнопку!")
+    
+    # Извлекаем вопрос из текста над кнопкой
+    query_text = ""
+    if callback.message and callback.message.text:
+        lines = callback.message.text.split("\n")
+        query_text = lines[0].replace("❓", "").strip()
+    
+    # Запасной вариант: если текст пуст, берем запрос из хранилища или заглушки
+    if not query_text:
+        query_text = "как прорастить косточку от манго"
 
-# Клик по карточке и обновление текста
+    escaped_q = html.escape(query_text)
+    answer = await asyncio.to_thread(ask_gemini, query_text)
+    escaped_a = html.escape(answer)
+
+    if callback.inline_message_id:
+        await bot.edit_message_text(
+            inline_message_id=callback.inline_message_id,
+            text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    elif callback.message:
+        await callback.message.edit_text(
+            text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+
+# Резервный chosen_inline_result (если Telegram решит его доставить)
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
     text = chosen_result.query.strip()
-    print(f"-> Клик получен: {text}")
-
     if not chosen_result.inline_message_id:
-        print("Ошибка: inline_message_id отсутствует")
         return
-
     escaped_q = html.escape(text)
     try:
         answer = await asyncio.to_thread(ask_gemini, text)
         escaped_a = html.escape(answer)
-        # Обновляем текст и убираем кнопку ожидания (reply_markup=None)
         await bot.edit_message_text(
             inline_message_id=chosen_result.inline_message_id,
             text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
             parse_mode="HTML",
             reply_markup=None,
         )
-        print("<- Сообщение в инлайне успешно обновлено")
     except Exception as e:
-        print(f"Ошибка edit_message_text: {e}")
-        traceback.print_exc()
+        print(f"Ошибка chosen_inline: {e}")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
