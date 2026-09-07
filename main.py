@@ -24,15 +24,15 @@ def ask_gemini(text: str) -> str:
                 model=model_name,
                 contents=text,
                 config={
-                    "system_instruction": "Отвечай кратко, емко и информативно.",
-                    "max_output_tokens": 300,
+                    "system_instruction": "Отвечай кратко, емко, 1-2 предложения.",
+                    "max_output_tokens": 150,
                 }
             )
             if response.text:
                 return response.text
         except Exception:
             continue
-    return "Не удалось получить ответ, попробуйте позже."
+    return "Сервер временно перегружен, попробуйте чуть позже."
 
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
@@ -43,7 +43,7 @@ async def inline_handler(query: types.InlineQuery):
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     escaped_q = html.escape(text)
 
-    # Мгновенный возврат карточки Telegram без ожидания API
+    # Мгновенно отдаем плашку пользователю (0.01 сек), не дожидаясь ответа нейросети
     item = InlineQueryResultArticle(
         id=q_id,
         title="✨ Спросить нейросеть:",
@@ -57,7 +57,6 @@ async def inline_handler(query: types.InlineQuery):
 
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
-    # Как только пользователь нажал на карточку, получаем ответ и обновляем сообщение
     if not chosen_result.inline_message_id:
         return
 
@@ -73,7 +72,7 @@ async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
             parse_mode="HTML"
         )
     except Exception as e:
-        print(f"Ошибка при обновлении: {e}")
+        print(f"Ошибка обновления сообщения: {e}")
         traceback.print_exc()
 
 async def main():
