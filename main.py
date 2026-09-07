@@ -11,6 +11,7 @@ import urllib.request
 import warnings
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
@@ -19,12 +20,12 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Подавление предупреждений библиотеки google-genai об AFC
+# Подавление предупреждений библиотеки google-genai
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message=".*Automatic function calling.*")
 warnings.filterwarnings("ignore", message=".*automatic function calling.*")
 
-# Попытка импорта DDGS (для текстового веб-поиска)
+# Попытка импорта DDGS для текстового поиска
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -40,8 +41,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Актуальные модели Google Gemini
-MODELS_POOL = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+# Актуальные модели: 3.5-flash-lite первой в очереди, чтобы не тратить суточный лимит 3.6-flash
+MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 DAILY_LIMIT = 1500
 
 usage_stats = {
@@ -94,18 +95,17 @@ def quick_translate_to_en(text: str) -> str:
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(text)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return "".join([part[0] for part in data[0] if part[0]]).strip()
     except Exception:
         return text
 
 def search_web_images(query: str, max_results: int = 8) -> list:
-    """Стабильный открытый поиск картинок без API-ключей, 401 и 403 блокировок."""
+    """Стабильный открытый поиск картинок через Wikimedia Commons."""
     items = []
     en_query = quick_translate_to_en(query)
-    
-    # Wikimedia Commons API (не требует авторизации, выдает прямые ссылки на JPG/PNG)
+
     for q in [query, en_query]:
         if items:
             break
@@ -118,7 +118,7 @@ def search_web_images(query: str, max_results: int = 8) -> list:
                 f"&format=json"
             )
             req = urllib.request.Request(url, headers={"User-Agent": "TelegramBotSearch/3.0 (contact@bot.local)"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 pages = data.get("query", {}).get("pages", {})
                 for _, page_info in pages.items():
@@ -126,7 +126,6 @@ def search_web_images(query: str, max_results: int = 8) -> list:
                     if not info_list:
                         continue
                     img_url = info_list[0].get("url", "")
-                    # Telegram принимает только прямые растровые картинки
                     if any(img_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
                         items.append({
                             "image": img_url,
@@ -152,7 +151,7 @@ def fetch_song_lyrics(query: str) -> str:
     try:
         url = f"https://lrclib.net/api/search?q={urllib.parse.quote(clean)}"
         req = urllib.request.Request(url, headers={"User-Agent": "TelegramMusicBot/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=4) as response:
             data = json.loads(response.read().decode("utf-8"))
             if data and isinstance(data, list):
                 for track in data:
@@ -181,7 +180,7 @@ def search_web(query: str, max_results: int = 3) -> str:
     return ""
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация ответов через Gemini (сначала 3.6-flash, затем 3.5-flash-lite)."""
+    """Генерация ответов через Gemini с контролем квот."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
@@ -211,7 +210,7 @@ def ask_gemini(prompt: str) -> str:
         except Exception as e:
             print(f"Ошибка модели {model_name}: {e}", flush=True)
             continue
-    return "Сервер временно перегружен, попробуй еще раз через минуту."
+    return "Сервер временно перегружен запросами, попробуй через минуту."
 
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
@@ -222,12 +221,12 @@ async def check_limits(message: types.Message):
 
     spent = usage_stats["requests_today"]
     left = max(0, DAILY_LIMIT - spent)
-    
+
     text = (
         f"📊 <b>Статистика бесплатных запросов</b>\n\n"
         f"• Потрачено сегодня: <b>{spent}</b>\n"
         f"• Осталось: <b>{left}</b> из {DAILY_LIMIT}\n"
-        f"• Сброс счетчика: полночь UTC (~10:00-11:00 МСК)"
+        f"• Сброс счетчика: полночь UTC"
     )
     await message.reply(text, parse_mode="HTML")
 
@@ -254,7 +253,7 @@ async def message_handler(message: types.Message):
         else:
             await status_msg.edit_text(
                 "Не нашел этот трек в базе. Попробуй написать так:\n"
-                "<code>текст Bladee Topman</code>", 
+                "<code>текст Bladee Topman</code>",
                 parse_mode="HTML"
             )
         return
@@ -277,7 +276,7 @@ async def photo_handler(message: types.Message):
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model="gemini-3.6-flash",
+            model="gemini-3.5-flash-lite",
             contents=[
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 caption,
@@ -302,106 +301,135 @@ async def inline_handler(query: types.InlineQuery):
 
     lower = text.lower()
 
-    # 1. ПОИСК ФОТО (АНАЛОГ @pic)
-    if any(lower.startswith(p) for p in PIC_TRIGGERS):
-        clean_query = text
-        for p in PIC_TRIGGERS:
-            if lower.startswith(p):
-                clean_query = text[len(p):].strip()
-                break
+    try:
+        # 1. ПОИСК ФОТО
+        if any(lower.startswith(p) for p in PIC_TRIGGERS):
+            clean_query = text
+            for p in PIC_TRIGGERS:
+                if lower.startswith(p):
+                    clean_query = text[len(p):].strip()
+                    break
 
-        if clean_query:
-            images = await asyncio.to_thread(search_web_images, clean_query)
-            if images:
-                items = []
-                for idx, img in enumerate(images):
-                    q_id = hashlib.md5(f"pic_{clean_query}_{idx}".encode("utf-8")).hexdigest()
-                    items.append(
-                        InlineQueryResultPhoto(
-                            id=q_id,
-                            photo_url=img["image"],
-                            thumbnail_url=img["thumb"],
-                            caption=f"🔍 <b>Фото:</b> {html.escape(clean_query)}",
-                            parse_mode="HTML",
-                        )
-                    )
-                await query.answer(items, cache_time=120, is_personal=True)
-                return
-            else:
-                q_id = hashlib.md5(f"err_{clean_query}".encode("utf-8")).hexdigest()
-                item = InlineQueryResultArticle(
-                    id=q_id,
-                    title="Картинки не найдены",
-                    description="Попробуй изменить запрос",
-                    input_message_content=InputTextMessageContent(
-                        message_text=f"По запросу '{clean_query}' картинок не нашлось.",
-                    ),
+            if clean_query:
+                images = await asyncio.wait_for(
+                    asyncio.to_thread(search_web_images, clean_query),
+                    timeout=5.5
                 )
-                await query.answer([item], cache_time=1, is_personal=True)
-                return
+                if images:
+                    items = []
+                    for idx, img in enumerate(images):
+                        q_id = hashlib.md5(f"pic_{clean_query}_{idx}".encode("utf-8")).hexdigest()
+                        items.append(
+                            InlineQueryResultPhoto(
+                                id=q_id,
+                                photo_url=img["image"],
+                                thumbnail_url=img["thumb"],
+                                caption=f"🔍 <b>Фото:</b> {html.escape(clean_query)}",
+                                parse_mode="HTML",
+                            )
+                        )
+                    await query.answer(items, cache_time=120, is_personal=True)
+                    return
+                else:
+                    q_id = hashlib.md5(f"err_{clean_query}".encode("utf-8")).hexdigest()
+                    item = InlineQueryResultArticle(
+                        id=q_id,
+                        title="Картинки не найдены",
+                        description="Попробуй изменить запрос",
+                        input_message_content=InputTextMessageContent(
+                            message_text=f"По запросу '{clean_query}' картинок не нашлось.",
+                        ),
+                    )
+                    await query.answer([item], cache_time=2, is_personal=True)
+                    return
 
-    # 2. ГЕНЕРАЦИЯ АРТОВ
-    if any(lower.startswith(p) for p in ["нарисуй", "draw", "картинка"]):
-        clean_prompt = text
-        for p in ["нарисуй", "draw", "картинка"]:
-            if lower.startswith(p):
-                clean_prompt = text[len(p):].strip()
-                break
+        # 2. ГЕНЕРАЦИЯ АРТОВ
+        if any(lower.startswith(p) for p in ["нарисуй", "draw", "картинка"]):
+            clean_prompt = text
+            for p in ["нарисуй", "draw", "картинка"]:
+                if lower.startswith(p):
+                    clean_prompt = text[len(p):].strip()
+                    break
 
-        en_prompt = quick_translate_to_en(clean_prompt)
-        seed = random.randint(1, 999999)
-        encoded = urllib.parse.quote(en_prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&nologo=true"
+            en_prompt = quick_translate_to_en(clean_prompt)
+            seed = random.randint(1, 999999)
+            encoded = urllib.parse.quote(en_prompt)
+            image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&nologo=true"
 
-        q_id = hashlib.md5(f"art_{text}_{seed}".encode("utf-8")).hexdigest()
-        item = InlineQueryResultPhoto(
-            id=q_id,
-            photo_url=image_url,
-            thumbnail_url=image_url,
-            caption=f"🎨 <b>Запрос:</b> {html.escape(clean_prompt)}",
-            parse_mode="HTML",
-        )
-        await query.answer([item], cache_time=0, is_personal=True)
-        return
-
-    # 3. ТЕКСТЫ ПЕСЕН
-    if any(trig in lower for trig in LYRICS_TRIGGERS):
-        lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
-        if lyrics:
-            q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
-            item = InlineQueryResultArticle(
+            q_id = hashlib.md5(f"art_{text}_{seed}".encode("utf-8")).hexdigest()
+            item = InlineQueryResultPhoto(
                 id=q_id,
-                title="Слова трека",
-                description=text[:40],
-                input_message_content=InputTextMessageContent(
-                    message_text=lyrics,
-                    parse_mode="HTML",
-                ),
+                photo_url=image_url,
+                thumbnail_url=image_url,
+                caption=f"🎨 <b>Запрос:</b> {html.escape(clean_prompt)}",
+                parse_mode="HTML",
             )
-            await query.answer([item], cache_time=60, is_personal=True)
+            await query.answer([item], cache_time=0, is_personal=True)
             return
 
-    # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI
-    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
-    answer = await asyncio.to_thread(ask_gemini, text)
-    escaped_q = html.escape(text)
-    escaped_a = html.escape(answer)
+        # 3. ТЕКСТЫ ПЕСЕН
+        if any(trig in lower for trig in LYRICS_TRIGGERS):
+            lyrics = await asyncio.wait_for(
+                asyncio.to_thread(fetch_song_lyrics, text),
+                timeout=5.0
+            )
+            if lyrics:
+                q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+                item = InlineQueryResultArticle(
+                    id=q_id,
+                    title="Слова трека",
+                    description=text[:40],
+                    input_message_content=InputTextMessageContent(
+                        message_text=lyrics,
+                        parse_mode="HTML",
+                    ),
+                )
+                await query.answer([item], cache_time=60, is_personal=True)
+                return
 
-    item = InlineQueryResultArticle(
-        id=q_id,
-        title=f"Ответ: {text[:35]}",
-        description=answer[:80],
-        input_message_content=InputTextMessageContent(
-            message_text=f"🐏 <b>{escaped_q}</b>\n\n{escaped_a}",
-            parse_mode="HTML",
-        ),
-    )
-    await query.answer([item], cache_time=60, is_personal=True)
+        # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI (с таймаутом до 6.5 секунд)
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(ask_gemini, text),
+            timeout=6.5
+        )
+        q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+        escaped_q = html.escape(text)
+        escaped_a = html.escape(answer)
+
+        item = InlineQueryResultArticle(
+            id=q_id,
+            title=f"Ответ: {text[:35]}",
+            description=answer[:80],
+            input_message_content=InputTextMessageContent(
+                message_text=f"🐏 <b>{escaped_q}</b>\n\n{escaped_a}",
+                parse_mode="HTML",
+            ),
+        )
+        await query.answer([item], cache_time=30, is_personal=True)
+
+    except (asyncio.TimeoutError, TimeoutError):
+        q_id = hashlib.md5(f"timeout_{text}".encode("utf-8")).hexdigest()
+        item = InlineQueryResultArticle(
+            id=q_id,
+            title="Сервер задумался...",
+            description="Повтори запрос чуть позже",
+            input_message_content=InputTextMessageContent(
+                message_text="⏳ Сервер сейчас отвечает с задержкой, попробуй ещё раз.",
+            ),
+        )
+        try:
+            await query.answer([item], cache_time=1, is_personal=True)
+        except TelegramBadRequest:
+            pass
+    except TelegramBadRequest:
+        pass
+    except Exception as e:
+        print(f"Ошибка инлайна: {e}", flush=True)
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот запущен на актуальных моделях Gemini 3.6 / 3.5!", flush=True)
+    print("Бот успешно запущен на Gemini 3.5 / 3.6!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
