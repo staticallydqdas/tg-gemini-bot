@@ -22,6 +22,9 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Хранилище запросов: query_id -> текст вопроса
+queries_cache = {}
+
 def ask_gemini(text: str) -> str:
     for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
         try:
@@ -57,73 +60,38 @@ async def inline_handler(query: types.InlineQuery):
     if len(text) < 2:
         return
 
-    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+    # Запоминаем вопрос
+    queries_cache[q_id] = text
+
     escaped_q = html.escape(text)
 
-    # Кнопка для прямого триггера обновления
+    # Индикатор
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⚡ Получить ответ нейросети", callback_data=f"ask:{q_id[:20]}")]
+            [InlineKeyboardButton(text="⏳ ИИ думает...", callback_data=f"q:{q_id}")]
         ]
     )
 
     item = InlineQueryResultArticle(
         id=q_id,
-        title="✨ Спросить нейросеть:",
-        description=text[:60],
+        title=f"Спросить: {text[:40]}",
+        description="Нажмите для отправки",
         input_message_content=InputTextMessageContent(
-            message_text=f"❓ <b>{escaped_q}</b>\n\n<i>Нажмите кнопку ниже, чтобы сгенерировать ответ:</i>",
+            message_text=f"❓ <b>{escaped_q}</b>\n\n<i>⏳ Нейросеть генерирует ответ...</i>",
             parse_mode="HTML",
         ),
         reply_markup=kb,
     )
-    await query.answer([item], cache_time=1, is_personal=True)
+    await query.answer([item], cache_time=0, is_personal=True)
 
-# Обработка нажатия на кнопку под сообщением
-@dp.callback_query(lambda c: c.data and c.data.startswith("ask:"))
-async def on_button_click(callback: types.CallbackQuery):
-    await callback.answer("⏳ Генерирую ответ...")
-    
-    # Получаем исходный текст вопроса из тела сообщения
-    full_text = callback.message.text if callback.message else ""
-    if not full_text and callback.inline_message_id:
-        # Для инлайн-сообщений исходный текст берем из сообщения
-        print("Получен инлайн-клик на кнопку!")
-    
-    # Извлекаем вопрос из текста над кнопкой
-    query_text = ""
-    if callback.message and callback.message.text:
-        lines = callback.message.text.split("\n")
-        query_text = lines[0].replace("❓", "").strip()
-    
-    # Запасной вариант: если текст пуст, берем запрос из хранилища или заглушки
-    if not query_text:
-        query_text = "как прорастить косточку от манго"
-
-    escaped_q = html.escape(query_text)
-    answer = await asyncio.to_thread(ask_gemini, query_text)
-    escaped_a = html.escape(answer)
-
-    if callback.inline_message_id:
-        await bot.edit_message_text(
-            inline_message_id=callback.inline_message_id,
-            text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
-            parse_mode="HTML",
-            reply_markup=None,
-        )
-    elif callback.message:
-        await callback.message.edit_text(
-            text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
-            parse_mode="HTML",
-            reply_markup=None,
-        )
-
-# Резервный chosen_inline_result (если Telegram решит его доставить)
+# Автоматическое обновление по chosen_inline_result
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
     text = chosen_result.query.strip()
     if not chosen_result.inline_message_id:
         return
+
     escaped_q = html.escape(text)
     try:
         answer = await asyncio.to_thread(ask_gemini, text)
@@ -135,7 +103,31 @@ async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
             reply_markup=None,
         )
     except Exception as e:
-        print(f"Ошибка chosen_inline: {e}")
+        print(f"Ошибка автообновления: {e}")
+
+# Запасной триггер по кнопке (берет РЕАЛЬНЫЙ вопрос из памяти)
+@dp.callback_query(lambda c: c.data and c.data.startswith("q:"))
+async def on_callback(callback: types.CallbackQuery):
+    await callback.answer("⏳ Обрабатываю...")
+    q_id = callback.data.split(":")[1]
+    
+    # Извлекаем оригинальный текст
+    original_text = queries_cache.get(q_id, "Запрос")
+
+    escaped_q = html.escape(original_text)
+    answer = await asyncio.to_thread(ask_gemini, original_text)
+    escaped_a = html.escape(answer)
+
+    if callback.inline_message_id:
+        try:
+            await bot.edit_message_text(
+                inline_message_id=callback.inline_message_id,
+                text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception as e:
+            print(f"Ошибка callback update: {e}")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
