@@ -60,11 +60,9 @@ async def inline_handler(query: types.InlineQuery):
             description=str(e)[:60],
             input_message_content=InputTextMessageContent(
                 message_text=f"⚠️ Не удалось получить ответ: {e}"
-            )
-        )
-        await query.answer([err_item], cache_time=1, is_personal=True)
-
-async def main():
+          async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(2)
     print("Бот готов к работе!")
     await dp.start_polling(bot)
 
