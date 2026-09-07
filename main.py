@@ -16,23 +16,26 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Безопасный импорт duckduckgo_search
+# 1. Поиск DuckDuckGo
 try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
 
-# Безопасный импорт lyricsgenius
-try:
-    import lyricsgenius
-    genius_client = lyricsgenius.Genius(
-        "dummy_token",
-        verbose=False,
-        remove_section_headers=False,
-        skip_non_songs=True,
-    )
-except Exception:
-    genius_client = None
+# 2. Подключение к официальному Genius по токену
+GENIUS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN")
+genius_client = None
+if GENIUS_TOKEN:
+    try:
+        import lyricsgenius
+        genius_client = lyricsgenius.Genius(
+            GENIUS_TOKEN,
+            verbose=False,
+            remove_section_headers=False,
+            skip_non_songs=True,
+        )
+    except Exception as e:
+        print(f"Ошибка подключения Genius: {e}", flush=True)
 
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
@@ -54,11 +57,10 @@ usage_stats = {
 SYSTEM_INSTRUCTION = (
     "Ты — остроумный, прямой и свойский товарищ с отличным чувством юмора. "
     "Общайся неформально, на равных, живым современным языком. "
-    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту и подчеркивает мысль. "
-    "Не пытайся вставлять ругательства в каждое предложение ради галочки. "
+    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту. "
     "К пользователю относись тепло и по-дружески: не груби, не быкуй и не токсичь. "
     "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам. "
-    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — всегда выдавай готовую инфу сразу."
+    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — давай ответы сразу."
 )
 
 SAFETY_SETTINGS = [
@@ -84,7 +86,7 @@ SEARCH_TRIGGERS = ("найди", "поищи", "поиск", "гугл", "акк
 LYRICS_TRIGGERS = ("текст песни", "слова песни", "lyrics")
 
 def track_usage():
-    """Счетчик запросов с автосбросом в полночь по UTC."""
+    """Счетчик запросов с автосбросом в полночь UTC."""
     today = datetime.now(timezone.utc).date()
     if usage_stats["current_date"] != today:
         usage_stats["current_date"] = today
@@ -92,7 +94,7 @@ def track_usage():
     usage_stats["requests_today"] += 1
 
 def fetch_song_lyrics(query: str) -> str:
-    """Прямой поиск текста песни через Genius без обращения к Gemini."""
+    """Прямой поиск текста песни в базе Genius."""
     if not genius_client:
         return ""
     clean = query.lower()
@@ -103,14 +105,14 @@ def fetch_song_lyrics(query: str) -> str:
         if song and song.lyrics:
             lines = song.lyrics.split("\n")
             lyrics = "\n".join(lines[1:]) if len(lines) > 1 else song.lyrics
-            # Ограничиваем длину сообщения лимитом Telegram в 4000 символов
+            # Ограничение Telegram на длину одного сообщения
             return f"🎶 <b>{html.escape(song.title)} — {html.escape(song.artist)}</b>\n\n{html.escape(lyrics[:3800])}"
     except Exception as e:
-        print(f"Ошибка парсинга Genius: {e}", flush=True)
+        print(f"Ошибка запроса к Genius: {e}", flush=True)
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск в DuckDuckGo."""
+    """Поиск инфы через DuckDuckGo."""
     if DDGS is None:
         return ""
     try:
@@ -125,7 +127,7 @@ def search_web(query: str, max_results: int = 3) -> str:
     return ""
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация ответа с веб-поиском."""
+    """Диалог с Gemini с подтягиванием веб-поиска."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
@@ -158,12 +160,12 @@ def ask_gemini(prompt: str) -> str:
     return "Сервер временно прилёг отдохнуть, попробуй через минуту."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод запроса для генератора картинок."""
+    """Перевод промпта для генератора картинок."""
     track_usage()
     try:
         res = ai_client.models.generate_content(
             model="gemini-3.5-flash-lite",
-            contents=f"Translate this image prompt into a detailed English prompt for text-to-image AI: {ru_prompt}. Return ONLY the English prompt.",
+            contents=f"Translate this image prompt into a detailed English prompt for text-to-image AI: {ru_prompt}. Return ONLY English text.",
             config={"max_output_tokens": 70, "temperature": 0.2}
         )
         if res.text:
@@ -172,7 +174,6 @@ def translate_prompt_to_en(ru_prompt: str) -> str:
         print(f"Ошибка перевода: {e}", flush=True)
     return ru_prompt
 
-# 1. Проверка лимита
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
     today = datetime.now(timezone.utc).date()
@@ -191,39 +192,37 @@ async def check_limits(message: types.Message):
     )
     await message.reply(text, parse_mode="HTML")
 
-# 2. Старт / Сброс
 @dp.message(F.text.in_({"/start", "/reset"}))
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 Здорово! Я на связи.\n\n"
-        "• Могу находить тексты треков — напиши 'текст песни ...'\n"
-        "• Ищу свежую инфу в сети — начни с 'найди' или 'новости'\n"
-        "• Кидай фото — разберу, что на нем\n"
-        "• Баланс бесплатных запросов: /limit\n"
-        "• В любых чатах через инлайн: @nikitaGODai_bot нарисуй ..."
+        "• <b>Тексты треков:</b> 'текст песни <название>'\n"
+        "• <b>Поиск инфы:</b> напиши 'найди ...'\n"
+        "• <b>Генерация картинок в инлайне:</b> @nikitaGODai_bot нарисуй ...\n"
+        "• <b>Лимиты:</b> /limit"
     )
 
-# 3. Текстовые сообщения в ЛС
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
-    # Перехват запросов на тексты песен напрямую через Genius
+    # Поиск текста песни через Genius
     if any(trig in lower for trig in LYRICS_TRIGGERS):
-        status_msg = await message.reply("🎶 Ищу слова песни...")
+        status_msg = await message.reply("🎶 Ищу слова песни на Genius...")
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
         if lyrics:
             await status_msg.edit_text(lyrics, parse_mode="HTML")
             return
-        await status_msg.edit_text("Не удалось нарыть этот трек на Genius, попробуй уточнить автора и название.")
+        # Если не нашел — НЕ отдаем в Gemini, чтобы она не сочиняла бред!
+        await status_msg.edit_text("Не удалось найти этот трек на Genius. Попробуй написать название и исполнителя точнее.")
         return
 
+    # Обычные текстовые запросы в Gemini
     status_msg = await message.reply("⏳ Соображаю...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
-# 4. Анализ фото в ЛС
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     track_usage()
@@ -254,11 +253,10 @@ async def photo_handler(message: types.Message):
         print(f"Ошибка фото: {e}", flush=True)
         await status_msg.edit_text("Что-то пошло не так при обработке фото.")
 
-# 5. Инлайн-режим
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
-    if len(text) < 3:
+    if len(text) < 2:
         return
 
     lower = text.lower()
@@ -276,8 +274,7 @@ async def inline_handler(query: types.InlineQuery):
         encoded = urllib.parse.quote(en_prompt)
         image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&nologo=true"
 
-        q_id = hashlib.md5(f"{text}_{seed}".encode("utf-8")).hexdigest()
-
+        q_id = hashlib.md5(f"art_{text}_{seed}".encode("utf-8")).hexdigest()
         item = InlineQueryResultPhoto(
             id=q_id,
             photo_url=image_url,
@@ -288,14 +285,14 @@ async def inline_handler(query: types.InlineQuery):
         await query.answer([item], cache_time=0, is_personal=True)
         return
 
-    # Тексты песен в инлайне
+    # Поиск текстов в инлайне
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
         if lyrics:
             q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
             item = InlineQueryResultArticle(
                 id=q_id,
-                title="Слова песни найдены",
+                title="Слова трека (Genius)",
                 description=text[:40],
                 input_message_content=InputTextMessageContent(
                     message_text=lyrics,
@@ -305,7 +302,7 @@ async def inline_handler(query: types.InlineQuery):
             await query.answer([item], cache_time=60, is_personal=True)
             return
 
-    # Обычные текстовые ответы через Gemini
+    # Обычные текстовые ответы Gemini в инлайне
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
@@ -325,7 +322,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов к работе со всеми функциями и прямым парсером песен!", flush=True)
+    print("Бот запущен с официальным токеном Genius!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
