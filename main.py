@@ -18,7 +18,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Попытка импорта DDGS (для веб-поиска)
+# Попытка импорта DDGS (для текстового веб-поиска)
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -97,53 +97,42 @@ def quick_translate_to_en(text: str) -> str:
         return text
 
 def search_web_images(query: str, max_results: int = 8) -> list:
-    """Поиск изображений без банов хостинга: Unsplash API + Wikimedia Commons."""
+    """Стабильный открытый поиск картинок без API-ключей, 401 и 403 блокировок."""
     items = []
     en_query = quick_translate_to_en(query)
     
-    # 1. Поиск через открытый Unsplash API
-    try:
-        url = f"https://unsplash.com/napi/search/photos?query={urllib.parse.quote(en_query)}&per_page={max_results}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for photo in data.get("results", []):
-                urls = photo.get("urls", {})
-                img = urls.get("regular") or urls.get("small")
-                thumb = urls.get("small") or img
-                if img:
-                    items.append({
-                        "image": img,
-                        "thumb": thumb,
-                        "title": photo.get("alt_description") or query
-                    })
+    # Wikimedia Commons API (не требует авторизации, выдает прямые ссылки на JPG/PNG)
+    for q in [query, en_query]:
         if items:
-            return items
-    except Exception as e:
-        print(f"Ошибка Unsplash: {e}", flush=True)
-
-    # 2. Fallback через Wikimedia Commons
-    try:
-        wiki_url = (
-            f"https://commons.wikimedia.org/w/api.php?action=query&generator=search"
-            f"&gsrnamespace=6&gsrsearch={urllib.parse.quote(en_query)}&gsrlimit={max_results}"
-            f"&prop=imageinfo&iiprop=url&format=json"
-        )
-        req = urllib.request.Request(wiki_url, headers={"User-Agent": "BotImageSearch/2.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            pages = data.get("query", {}).get("pages", {})
-            for _, page in pages.items():
-                info = page.get("imageinfo", [{}])[0]
-                img = info.get("url")
-                if img and any(img.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                    items.append({
-                        "image": img,
-                        "thumb": img,
-                        "title": page.get("title", "Image")
-                    })
-    except Exception as e:
-        print(f"Ошибка Wikimedia: {e}", flush=True)
+            break
+        try:
+            encoded = urllib.parse.quote(q)
+            url = (
+                f"https://commons.wikimedia.org/w/api.php?action=query"
+                f"&generator=search&gsrnamespace=6&gsrsearch={encoded}"
+                f"&gsrlimit={max_results * 2}&prop=imageinfo&iiprop=url|size"
+                f"&format=json"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "TelegramBotSearch/3.0 (contact@bot.local)"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                pages = data.get("query", {}).get("pages", {})
+                for _, page_info in pages.items():
+                    info_list = page_info.get("imageinfo")
+                    if not info_list:
+                        continue
+                    img_url = info_list[0].get("url", "")
+                    # Telegram принимает только прямые растровые картинки
+                    if any(img_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+                        items.append({
+                            "image": img_url,
+                            "thumb": img_url,
+                            "title": page_info.get("title", "Image").replace("File:", "")
+                        })
+                    if len(items) >= max_results:
+                        break
+        except Exception as e:
+            print(f"Ошибка поиска Wikimedia ({q}): {e}", flush=True)
 
     return items
 
@@ -173,7 +162,7 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск текстовой инфы."""
+    """Поиск информации в сети."""
     if DDGS is None:
         return ""
     try:
