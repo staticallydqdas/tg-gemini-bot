@@ -4,6 +4,8 @@ import html
 import io
 import logging
 import os
+import sys
+import traceback
 import urllib.parse
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F, types
@@ -13,7 +15,6 @@ from aiogram.types import (
     InputTextMessageContent,
 )
 from google import genai
-from google.genai import types as genai_types
 
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
@@ -27,104 +28,72 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 user_history = defaultdict(list)
 MAX_HISTORY = 6
 
-SYSTEM_PROMPT = (
+SYSTEM_INSTRUCTION = (
     "Ты — полезный, умный и лаконичный ИИ-ассистент. "
-    "Отвечай емко, по делу, с четкой структурой. "
-    "Никакой воды и шаблонных вежливых вступлений. Сразу к сути."
+    "Отвечай емко, по делу, структурированно. "
+    "Без лишних вступительных фраз и шаблонной вежливости. Сразу к сути."
 )
 
-def ask_gemini(contents: list) -> str:
-    """Стабильный вызов Gemini без блокировок поиска."""
-    config = genai_types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0.3,
-        max_output_tokens=800,
-    )
+def ask_gemini(prompt: str) -> str:
+    """Прямой вызов Gemini без зависающих инструментов."""
     for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
-                contents=contents,
-                config=config,
+                contents=prompt,
+                config={
+                    "system_instruction": SYSTEM_INSTRUCTION,
+                    "max_output_tokens": 800,
+                    "temperature": 0.3,
+                },
             )
             if response.text:
                 return response.text.strip()
         except Exception as e:
-            print(f"Ошибка {model_name}: {e}")
+            print(f"Ошибка {model_name}: {e}", flush=True)
             continue
-    return "Не удалось получить ответ, попробуйте позже."
+    return "Не удалось получить ответ, попробуйте чуть позже."
 
-# 1. Очистка контекста
+# 1. Очистка истории в ЛС
 @dp.message(F.text == "/reset")
 async def reset_context(message: types.Message):
     user_history[message.from_user.id].clear()
-    await message.reply("🧹 История очищена!")
+    await message.reply("🧹 Контекст очищен!")
 
 # 2. Текстовые сообщения в ЛС
 @dp.message(F.text)
-async def text_handler(message: types.Message):
-    user_id = message.from_user.id
-    user_text = message.text.strip()
+async def message_handler(message: types.Message):
+    text = message.text.strip()
+    status_msg = await message.reply("⏳ Генерирую ответ...")
+    answer = await asyncio.to_thread(ask_gemini, text)
+    await status_msg.edit_text(answer)
 
-    status_msg = await message.reply("⏳ Думаю...")
-
-    user_history[user_id].append({"role": "user", "text": user_text})
-    if len(user_history[user_id]) > MAX_HISTORY:
-        user_history[user_id] = user_history[user_id][-MAX_HISTORY:]
-
-    contents = [
-        genai_types.Content(
-            role=turn["role"],
-            parts=[genai_types.Part.from_text(text=turn["text"])]
-        )
-        for turn in user_history[user_id]
-    ]
-
-    answer = await asyncio.to_thread(ask_gemini, contents)
-    user_history[user_id].append({"role": "model", "text": answer})
-
-    for i in range(0, len(answer), 4000):
-        chunk = answer[i:i+4000]
-        if i == 0:
-            await status_msg.edit_text(chunk)
-        else:
-            await message.answer(chunk)
-
-# 3. Фотографии в ЛС
+# 3. Фотографии в ЛС (анализ изображений)
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
-    status_msg = await message.reply("🔍 Анализирую изображение...")
+    status_msg = await message.reply("🔍 Анализирую фото...")
     photo = message.photo[-1]
     file_io = io.BytesIO()
     await bot.download(photo, destination=file_io)
     image_bytes = file_io.getvalue()
 
-    caption = message.caption.strip() if message.caption else "Опиши подробно, что на этой фотографии."
-    contents = [
-        genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-        genai_types.Part.from_text(text=caption),
-    ]
+    caption = message.caption.strip() if message.caption else "Что изображено на этом фото?"
+    
+    try:
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model="gemini-3.5-flash-lite",
+            contents=[
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
+                caption,
+            ],
+        )
+        await status_msg.edit_text(response.text if response.text else "Не удалось разобрать изображение.")
+    except Exception as e:
+        print(f"Ошибка фото: {e}", flush=True)
+        await status_msg.edit_text("Ошибка при обработке изображения.")
 
-    answer = await asyncio.to_thread(ask_gemini, contents)
-    await status_msg.edit_text(answer)
-
-# 4. Голосовые сообщения в ЛС
-@dp.message(F.voice)
-async def voice_handler(message: types.Message):
-    status_msg = await message.reply("🎙 Слушаю голосовое...")
-    file_io = io.BytesIO()
-    await bot.download(message.voice, destination=file_io)
-    voice_bytes = file_io.getvalue()
-
-    contents = [
-        genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg"),
-        genai_types.Part.from_text(text="Расшифруй это голосовое и дай краткий ответ на то, что там сказано."),
-    ]
-
-    answer = await asyncio.to_thread(ask_gemini, contents)
-    await status_msg.edit_text(answer)
-
-# 5. Инлайн-режим: Умное разделение на текст и генерацию картинок
+# 4. Инлайн-режим (картинки + текст)
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -132,39 +101,37 @@ async def inline_handler(query: types.InlineQuery):
         return
 
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
-    lower_text = text.lower()
+    lower = text.lower()
 
-    # Если запрос начинается со слов про рисование:
-    if lower_text.startswith(("нарисуй", "картинка", "фото", "draw", "image")):
-        prompt = text
-        for trigger in ["нарисуй", "картинка", "фото"]:
-            if lower_text.startswith(trigger):
-                prompt = text[len(trigger):].strip()
+    # Если запрос на генерацию картинки
+    if any(lower.startswith(prefix) for prefix in ["нарисуй", "фото", "картинка", "draw"]):
+        clean_prompt = text
+        for p in ["нарисуй", "фото", "картинка", "draw"]:
+            if lower.startswith(p):
+                clean_prompt = text[len(p):].strip()
                 break
 
-        encoded_prompt = urllib.parse.quote(prompt)
+        encoded_prompt = urllib.parse.quote(clean_prompt)
         image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
 
         item = InlineQueryResultPhoto(
             id=q_id,
             photo_url=image_url,
             thumbnail_url=image_url,
-            caption=f"🎨 <b>Запрос:</b> {html.escape(prompt)}",
+            caption=f"🎨 <b>Промпт:</b> {html.escape(clean_prompt)}",
             parse_mode="HTML",
         )
-        await query.answer([item], cache_time=60, is_personal=True)
+        await query.answer([item], cache_time=30, is_personal=True)
         return
 
-    # Обычный текстовый запрос к Gemini
-    contents = [genai_types.Part.from_text(text=text)]
-    answer = await asyncio.to_thread(ask_gemini, contents)
-
+    # Обычный текстовый запрос к нейросети
+    answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
     escaped_a = html.escape(answer)
 
     item = InlineQueryResultArticle(
         id=q_id,
-        title=f"✨ Ответ на: {text[:40]}",
+        title=f"Ответ: {text[:35]}",
         description=answer[:80],
         input_message_content=InputTextMessageContent(
             message_text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
@@ -176,7 +143,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот успешно запущен!")
+    print("Бот успешно запущен и слушает события!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
