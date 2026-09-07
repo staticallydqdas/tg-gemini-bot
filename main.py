@@ -1,109 +1,28 @@
-import asyncio
-import hashlib
-import html
-import io
-import logging
-import os
-import sys
-import traceback
-import urllib.parse
-from collections import defaultdict
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import (
-    InlineQueryResultArticle,
-    InlineQueryResultPhoto,
-    InputTextMessageContent,
-)
-from google import genai
+import random
 
-logging.getLogger("google.genai").setLevel(logging.ERROR)
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-user_history = defaultdict(list)
-MAX_HISTORY = 6
-
-SYSTEM_INSTRUCTION = (
-    "Ты — полезный, умный и лаконичный ИИ-ассистент. "
-    "Отвечай емко, по делу, структурированно. "
-    "Без лишних вступительных фраз и шаблонной вежливости. Сразу к сути."
-)
-
-def ask_gemini(prompt: str) -> str:
-    """Прямой вызов Gemini без зависающих инструментов."""
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
-        try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config={
-                    "system_instruction": SYSTEM_INSTRUCTION,
-                    "max_output_tokens": 800,
-                    "temperature": 0.3,
-                },
-            )
-            if response.text:
-                return response.text.strip()
-        except Exception as e:
-            print(f"Ошибка {model_name}: {e}", flush=True)
-            continue
-    return "Не удалось получить ответ, попробуйте чуть позже."
-
-# 1. Очистка истории в ЛС
-@dp.message(F.text == "/reset")
-async def reset_context(message: types.Message):
-    user_history[message.from_user.id].clear()
-    await message.reply("🧹 Контекст очищен!")
-
-# 2. Текстовые сообщения в ЛС
-@dp.message(F.text)
-async def message_handler(message: types.Message):
-    text = message.text.strip()
-    status_msg = await message.reply("⏳ Генерирую ответ...")
-    answer = await asyncio.to_thread(ask_gemini, text)
-    await status_msg.edit_text(answer)
-
-# 3. Фотографии в ЛС (анализ изображений)
-@dp.message(F.photo)
-async def photo_handler(message: types.Message):
-    status_msg = await message.reply("🔍 Анализирую фото...")
-    photo = message.photo[-1]
-    file_io = io.BytesIO()
-    await bot.download(photo, destination=file_io)
-    image_bytes = file_io.getvalue()
-
-    caption = message.caption.strip() if message.caption else "Что изображено на этом фото?"
-    
+# Вспомогательная функция для перевода и улучшения промпта через Gemini
+def translate_prompt_to_en(ru_prompt: str) -> str:
     try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
+        res = ai_client.models.generate_content(
             model="gemini-3.5-flash-lite",
-            contents=[
-                {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
-                caption,
-            ],
+            contents=f"Translate this image generation prompt to detailed English for Stable Diffusion. Output ONLY the English prompt, no other text: {ru_prompt}",
+            config={"max_output_tokens": 80, "temperature": 0.2}
         )
-        await status_msg.edit_text(response.text if response.text else "Не удалось разобрать изображение.")
+        if res.text:
+            return res.text.strip().replace("\n", " ")
     except Exception as e:
-        print(f"Ошибка фото: {e}", flush=True)
-        await status_msg.edit_text("Ошибка при обработке изображения.")
+        print(f"Ошибка перевода промпта: {e}", flush=True)
+    return ru_prompt
 
-# 4. Инлайн-режим (картинки + текст)
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
     if len(text) < 2:
         return
 
-    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     lower = text.lower()
 
-    # Если запрос на генерацию картинки
+    # Генерация изображений
     if any(lower.startswith(prefix) for prefix in ["нарисуй", "фото", "картинка", "draw"]):
         clean_prompt = text
         for p in ["нарисуй", "фото", "картинка", "draw"]:
@@ -111,20 +30,29 @@ async def inline_handler(query: types.InlineQuery):
                 clean_prompt = text[len(p):].strip()
                 break
 
-        encoded_prompt = urllib.parse.quote(clean_prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        # 1. Переводим в понятный для диффузии английский промпт
+        en_prompt = await asyncio.to_thread(translate_prompt_to_en, clean_prompt)
+        
+        # 2. Генерируем уникальный seed, чтобы сбить старый кэш
+        seed = random.randint(1, 999999)
+        encoded = urllib.parse.quote(en_prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&nologo=true"
+
+        q_id = hashlib.md5(f"{text}_{seed}".encode("utf-8")).hexdigest()
 
         item = InlineQueryResultPhoto(
             id=q_id,
             photo_url=image_url,
             thumbnail_url=image_url,
-            caption=f"🎨 <b>Промпт:</b> {html.escape(clean_prompt)}",
+            caption=f"🎨 <b>Запрос:</b> {html.escape(clean_prompt)}",
             parse_mode="HTML",
         )
-        await query.answer([item], cache_time=30, is_personal=True)
+        # cache_time=0 отключает залипание старых картинок
+        await query.answer([item], cache_time=0, is_personal=True)
         return
 
-    # Обычный текстовый запрос к нейросети
+    # Обычный текстовый запрос к Gemini
+    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
     escaped_a = html.escape(answer)
@@ -138,13 +66,4 @@ async def inline_handler(query: types.InlineQuery):
             parse_mode="HTML",
         ),
     )
-    await query.answer([item], cache_time=120, is_personal=True)
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(1)
-    print("Бот успешно запущен и слушает события!", flush=True)
-    await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await query.answer([item], cache_time=60, is_personal=True)
