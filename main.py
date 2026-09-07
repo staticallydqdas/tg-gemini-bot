@@ -13,12 +13,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
 def ask_gemini(text: str) -> str:
     response = ai_client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=f"Ответь кратко и по делу (1-3 предложения): {text}",
-        config={"tools": []}
+        contents=text,
+        config={
+            "system_instruction": "Отвечай предельно кратко, емко, не более 1-2 предложений.",
+            "max_output_tokens": 120,
+        }
     )
     return response.text or "Пустой ответ."
 
