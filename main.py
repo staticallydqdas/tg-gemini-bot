@@ -19,8 +19,8 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def ask_gemini(text: str) -> str:
-    # Используем lite-модель для высоких лимитов, а стандартную как запасную
-    for model_name in ["gemini-3.6-flash-lite", "gemini-3.6-flash"]:
+    # Рабочие названия моделей в v1beta с высоким бесплатным суточным лимитом
+    for model_name in ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
