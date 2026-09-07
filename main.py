@@ -17,9 +17,10 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 def ask_gemini(text: str) -> str:
     response = ai_client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=f"Ответь кратко и емко (1-2 предложения): {text}"
+        contents=f"Ответь кратко и по делу (1-3 предложения): {text}",
+        config={"tools": []}
     )
-    return response.text or "Ответ не сформирован."
+    return response.text or "Пустой ответ."
 
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
@@ -27,12 +28,11 @@ async def inline_handler(query: types.InlineQuery):
     if len(text) < 2:
         return
 
-    print(f"-> Запрос: {text}")
+    print(f"-> Входящий запрос: {text}")
 
     try:
-        # Выполняем в отдельном потоке, чтобы не подвешивать Telegram
         answer = await asyncio.to_thread(ask_gemini, text)
-        print(f"<- Ответ готов ({len(answer)} симв.)")
+        print(f"<- Ответ сформирован ({len(answer)} симв.)")
 
         q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
         escaped_q = html.escape(text)
@@ -40,7 +40,7 @@ async def inline_handler(query: types.InlineQuery):
 
         item = InlineQueryResultArticle(
             id=q_id,
-            title="💡 Нажмите для отправки ответа:",
+            title="💡 Отправить ответ в чат:",
             description=answer[:80].replace("\n", " ") + "...",
             input_message_content=InputTextMessageContent(
                 message_text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
