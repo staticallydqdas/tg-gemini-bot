@@ -24,7 +24,10 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Инструкция с жестким требованием мата
+# Актуальные модели Gemini
+PRIMARY_MODEL = "gemini-3.6-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+
 SYSTEM_INSTRUCTION = (
     "Ты — дворовый, максимально циничный, угарный и дерзкий кент. "
     "Твое главное правило стиля: ты ОБЯЗАН в каждом ответе использовать отборный русский мат (бля, нахуй, пиздец, ебать и т.д.) для связки слов и выражения эмоций. "
@@ -33,7 +36,6 @@ SYSTEM_INSTRUCTION = (
     "Пользователя не чмори напрямую, но саму ситуацию или вопрос разбирай без купюр и с матом."
 )
 
-# Полное отключение всех фильтров цензуры
 SAFETY_SETTINGS = [
     genai_types.SafetySetting(
         category=genai_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -54,8 +56,8 @@ SAFETY_SETTINGS = [
 ]
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация текста с матом и отключенной цензурой."""
-    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    """Генерация текста с актуальными моделями."""
+    for model_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
@@ -75,10 +77,10 @@ def ask_gemini(prompt: str) -> str:
     return "Пиздец какой-то с сервером, не могу сейчас ответить."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод для генерации картинок."""
+    """Перевод промпта через быструю lite-модель."""
     try:
         res = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=FALLBACK_MODEL,
             contents=f"Translate this image prompt into a detailed English prompt for text-to-image AI: {ru_prompt}. Output ONLY the prompt in English.",
             config={"max_output_tokens": 80, "temperature": 0.2}
         )
@@ -112,7 +114,7 @@ async def photo_handler(message: types.Message):
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model="gemini-2.5-flash",
+            model=PRIMARY_MODEL,
             contents=[
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 caption,
@@ -179,7 +181,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов разъёбывать!", flush=True)
+    print("Бот готов к работе на актуальных моделях!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
