@@ -18,7 +18,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Поиск DuckDuckGo (для поиска фактов в вебе)
+# Поиск через DuckDuckGo (и для веба, и для картинок)
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -28,10 +28,6 @@ logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Переменные для поиска картинок через Google
-GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -51,7 +47,7 @@ SYSTEM_INSTRUCTION = (
     "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту. "
     "К пользователю относись тепло и по-дружески: не груби, не быкуй и не токсичь. "
     "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам. "
-    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — давай ответы сразу."
+    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — выдавай информацию прямо в ответ."
 )
 
 SAFETY_SETTINGS = [
@@ -84,39 +80,29 @@ def track_usage():
         usage_stats["requests_today"] = 0
     usage_stats["requests_today"] += 1
 
-def search_google_images(query: str, num: int = 8) -> list:
-    """Поиск картинок напрямую через Google Custom Search API."""
-    if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
-        print("Ошибка: переменные GOOGLE_SEARCH_KEY или GOOGLE_SEARCH_CX не заданы!", flush=True)
+def search_web_images(query: str, max_results: int = 8) -> list:
+    """Быстрый поиск картинок по сети без ограничений (аналог @pic)."""
+    if DDGS is None:
         return []
-    
-    encoded_q = urllib.parse.quote(query)
-    url = (
-        f"https://www.googleapis.com/customsearch/v1"
-        f"?key={GOOGLE_SEARCH_KEY}&cx={GOOGLE_SEARCH_CX}&q={encoded_q}&searchType=image&num={num}"
-    )
-    
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            items = []
-            for item in data.get("items", []):
-                img_url = item.get("link")
-                thumb_url = item.get("image", {}).get("thumbnailLink") or img_url
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.images(query, max_results=max_results):
+                img_url = r.get("image")
+                thumb_url = r.get("thumbnail") or img_url
                 if img_url:
-                    items.append({
+                    results.append({
                         "image": img_url,
                         "thumb": thumb_url,
-                        "title": item.get("title", "Google Image")
+                        "title": r.get("title", "Image")
                     })
-            return items
+        return results
     except Exception as e:
-        print(f"Ошибка Google Images API: {e}", flush=True)
+        print(f"Ошибка поиска картинок: {e}", flush=True)
     return []
 
 def fetch_song_lyrics(query: str) -> str:
-    """Прямой и стабильный поиск текста трека через LRCLIB."""
+    """Точный поиск реального текста песни через базу LRCLIB."""
     clean = query.lower()
     for word in ["найди", "дай", "текст песни", "слова песни", "lyrics", "песня", "песни", "текст"]:
         clean = clean.replace(word, " ")
@@ -143,6 +129,7 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
+    """Поиск текстовой инфы."""
     if DDGS is None:
         return ""
     try:
@@ -153,7 +140,7 @@ def search_web(query: str, max_results: int = 3) -> str:
         if results:
             return "\n\n".join(results)
     except Exception as e:
-        print(f"Ошибка DuckDuckGo: {e}", flush=True)
+        print(f"Ошибка поиска веба: {e}", flush=True)
     return ""
 
 def ask_gemini(prompt: str) -> str:
@@ -224,7 +211,7 @@ async def check_limits(message: types.Message):
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 Здорово! Я на связи.\n\n"
-        "• <b>Поиск картинок (Google):</b> @nikitaGODai_bot pic <запрос>\n"
+        "• <b>Поиск картинок:</b> @nikitaGODai_bot pic <запрос>\n"
         "• <b>Генерация картинок:</b> @nikitaGODai_bot нарисуй <запрос>\n"
         "• <b>Тексты треков:</b> 'текст песни <название>'\n"
         "• <b>Поиск инфы:</b> напиши 'найди ...'\n"
@@ -236,7 +223,7 @@ async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
-    # Перехват текстов песен (изолировано от Gemini)
+    # Поиск текста трека
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         status_msg = await message.reply("🎶 Ищу слова трека в базе...")
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
@@ -250,7 +237,7 @@ async def message_handler(message: types.Message):
             )
         return
 
-    # Обычный диалог с Gemini
+    # Обычный чат с Gemini
     status_msg = await message.reply("⏳ Соображаю...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
@@ -294,7 +281,7 @@ async def inline_handler(query: types.InlineQuery):
 
     lower = text.lower()
 
-    # 1. GOOGLE КАРТИНКИ (АНАЛОГ @PIC)
+    # 1. ПОИСК КАРТИНОК (АНАЛОГ @pic)
     if any(lower.startswith(p) for p in PIC_TRIGGERS):
         clean_query = text
         for p in PIC_TRIGGERS:
@@ -303,21 +290,33 @@ async def inline_handler(query: types.InlineQuery):
                 break
 
         if clean_query:
-            images = await asyncio.to_thread(search_google_images, clean_query)
+            images = await asyncio.to_thread(search_web_images, clean_query)
             if images:
                 items = []
                 for idx, img in enumerate(images):
-                    q_id = hashlib.md5(f"gpic_{clean_query}_{idx}".encode("utf-8")).hexdigest()
+                    q_id = hashlib.md5(f"pic_{clean_query}_{idx}".encode("utf-8")).hexdigest()
                     items.append(
                         InlineQueryResultPhoto(
                             id=q_id,
                             photo_url=img["image"],
                             thumbnail_url=img["thumb"],
-                            caption=f"🔍 <b>Google Картинки:</b> {html.escape(clean_query)}",
+                            caption=f"🔍 <b>Фото:</b> {html.escape(clean_query)}",
                             parse_mode="HTML",
                         )
                     )
                 await query.answer(items, cache_time=300, is_personal=True)
+                return
+            else:
+                q_id = hashlib.md5(f"err_{clean_query}".encode("utf-8")).hexdigest()
+                item = InlineQueryResultArticle(
+                    id=q_id,
+                    title="Картинки не найдены",
+                    description="Попробуй изменить запрос",
+                    input_message_content=InputTextMessageContent(
+                        message_text=f"По запросу '{clean_query}' ничего не нашлось.",
+                    ),
+                )
+                await query.answer([item], cache_time=10, is_personal=True)
                 return
 
     # 2. ГЕНЕРАЦИЯ АРТОВ ЧЕРЕЗ ИИ
@@ -381,7 +380,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов к работе!", flush=True)
+    print("Бот готов к работе: поиск картинок и текстов настроен!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
