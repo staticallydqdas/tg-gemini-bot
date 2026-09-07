@@ -16,13 +16,22 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 def ask_gemini(text: str) -> str:
-    response = ai_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=text,
-        config={
-            "system_instruction": "Отвечай предельно кратко, емко, не более 1-2 предложений.",
-            "max_output_tokens": 120,
-        }
+    # Пробуем основную стабильную модель, при сбое — легкую резервную
+    for model_name in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=text,
+                config={
+                    "system_instruction": "Отвечай кратко, 1-2 предложения.",
+                    "max_output_tokens": 100,
+                }
+            )
+            if response.text:
+                return response.text
+        except Exception:
+            continue
+    return "Сервер перегружен, попробуйте еще раз."
     )
     return response.text or "Пустой ответ."
 
