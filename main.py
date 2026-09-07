@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
 from google import genai
 
+# Отключаем лишний шум библиотек в логах
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -18,7 +19,8 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def ask_gemini(text: str) -> str:
-    for model_name in ["gemini-2.5-flash-lite", "gemini-2.5-flash"]:
+    # Используем lite-модель для высоких лимитов, а стандартную как запасную
+    for model_name in ["gemini-3.6-flash-lite", "gemini-3.6-flash"]:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
@@ -45,7 +47,7 @@ async def message_handler(message: types.Message):
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
-# Инлайн-запрос (показываем всплывающую карточку)
+# Инлайн-режим: моментальная выдача карточки без задержки Telegram
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -66,14 +68,13 @@ async def inline_handler(query: types.InlineQuery):
     )
     await query.answer([item], cache_time=1, is_personal=True)
 
-# Событие после отправки карточки
+# Событие после отправки карточки: обновление текста на сгенерированный ответ
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
     text = chosen_result.query.strip()
     print(f"-> Клик получен: {text}")
-    
+
     if not chosen_result.inline_message_id:
-        print("inline_message_id отсутствует")
         return
 
     escaped_q = html.escape(text)
@@ -87,16 +88,15 @@ async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
         )
         print("<- Сообщение успешно обновлено")
     except Exception as e:
-        print(f"Ошибка edit_message_text: {e}")
+        print(f"Ошибка при обновлении: {e}")
         traceback.print_exc()
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
     print("Бот готов к работе!")
-    # Явно указываем Telegram отправлять события chosen_inline_result
     await dp.start_polling(
-        bot, 
+        bot,
         allowed_updates=["message", "inline_query", "chosen_inline_result"]
     )
 
