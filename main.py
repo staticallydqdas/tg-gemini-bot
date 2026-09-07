@@ -24,16 +24,28 @@ def ask_gemini(text: str) -> str:
                 model=model_name,
                 contents=text,
                 config={
-                    "system_instruction": "Отвечай кратко, емко, 1-2 предложения.",
-                    "max_output_tokens": 150,
+                    "system_instruction": "Отвечай кратко, емко, не более 2 предложений.",
+                    "max_output_tokens": 120,
                 }
             )
             if response.text:
                 return response.text
-        except Exception:
+        except Exception as e:
+            print(f"Ошибка {model_name}: {e}")
             continue
-    return "Сервер временно перегружен, попробуйте чуть позже."
+    return "Не удалось получить ответ, попробуйте позже."
 
+# Ответ в личных сообщениях боту
+@dp.message()
+async def message_handler(message: types.Message):
+    if not message.text:
+        return
+    text = message.text.strip()
+    status_msg = await message.reply("⏳ Генерирую ответ...")
+    answer = await asyncio.to_thread(ask_gemini, text)
+    await status_msg.edit_text(answer)
+
+# Инлайн-запрос (показываем всплывающую карточку)
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -43,7 +55,6 @@ async def inline_handler(query: types.InlineQuery):
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     escaped_q = html.escape(text)
 
-    # Мгновенно отдаем плашку пользователю (0.01 сек), не дожидаясь ответа нейросети
     item = InlineQueryResultArticle(
         id=q_id,
         title="✨ Спросить нейросеть:",
@@ -55,14 +66,17 @@ async def inline_handler(query: types.InlineQuery):
     )
     await query.answer([item], cache_time=1, is_personal=True)
 
+# Событие после отправки карточки
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
+    text = chosen_result.query.strip()
+    print(f"-> Клик получен: {text}")
+    
     if not chosen_result.inline_message_id:
+        print("inline_message_id отсутствует")
         return
 
-    text = chosen_result.query.strip()
     escaped_q = html.escape(text)
-
     try:
         answer = await asyncio.to_thread(ask_gemini, text)
         escaped_a = html.escape(answer)
@@ -71,15 +85,20 @@ async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
             text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
             parse_mode="HTML"
         )
+        print("<- Сообщение успешно обновлено")
     except Exception as e:
-        print(f"Ошибка обновления сообщения: {e}")
+        print(f"Ошибка edit_message_text: {e}")
         traceback.print_exc()
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
     print("Бот готов к работе!")
-    await dp.start_polling(bot)
+    # Явно указываем Telegram отправлять события chosen_inline_result
+    await dp.start_polling(
+        bot, 
+        allowed_updates=["message", "inline_query", "chosen_inline_result"]
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
