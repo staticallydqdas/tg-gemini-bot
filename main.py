@@ -18,7 +18,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Попытка импорта DDGS (оставляем только как вспомогательный веб-поиск)
+# Попытка импорта DDGS (для веб-поиска)
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -36,7 +36,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODELS_POOL = ["gemini-2.5-flash", "gemini-1.5-flash"]
+# Актуальные модели Google Gemini
+MODELS_POOL = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
 DAILY_LIMIT = 1500
 
 usage_stats = {
@@ -83,7 +84,7 @@ def track_usage():
     usage_stats["requests_today"] += 1
 
 def quick_translate_to_en(text: str) -> str:
-    """Быстрый бесплатный перевод запроса через Google Translate API."""
+    """Быстрый перевод запроса через Google Translate API для качественного поиска фото."""
     if not any(ord(c) > 127 for c in text):
         return text
     try:
@@ -96,11 +97,11 @@ def quick_translate_to_en(text: str) -> str:
         return text
 
 def search_web_images(query: str, max_results: int = 8) -> list:
-    """Стабильный поиск изображений через API без блокировок IP хостинга."""
+    """Поиск изображений без банов хостинга: Unsplash API + Wikimedia Commons."""
     items = []
     en_query = quick_translate_to_en(query)
     
-    # 1. Поиск через открытый Unsplash API (по англ. названию работает идеально)
+    # 1. Поиск через открытый Unsplash API
     try:
         url = f"https://unsplash.com/napi/search/photos?query={urllib.parse.quote(en_query)}&per_page={max_results}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -147,7 +148,7 @@ def search_web_images(query: str, max_results: int = 8) -> list:
     return items
 
 def fetch_song_lyrics(query: str) -> str:
-    """Точный поиск текста через LRCLIB."""
+    """Точный поиск реального текста песни через базу LRCLIB."""
     clean = query.lower()
     for word in ["найди", "дай", "текст песни", "слова песни", "lyrics", "песня", "песни", "текст"]:
         clean = clean.replace(word, " ")
@@ -172,6 +173,7 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
+    """Поиск текстовой инфы."""
     if DDGS is None:
         return ""
     try:
@@ -186,6 +188,7 @@ def search_web(query: str, max_results: int = 3) -> str:
     return ""
 
 def ask_gemini(prompt: str) -> str:
+    """Генерация ответов через Gemini (сначала 3.6-flash, затем 3.5-flash-lite)."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
@@ -217,9 +220,6 @@ def ask_gemini(prompt: str) -> str:
             continue
     return "Сервер временно перегружен, попробуй еще раз через минуту."
 
-def translate_prompt_to_en(ru_prompt: str) -> str:
-    return quick_translate_to_en(ru_prompt)
-
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
     today = datetime.now(timezone.utc).date()
@@ -243,7 +243,7 @@ async def cmd_start(message: types.Message):
     await message.reply(
         "👋 Здорово! Я на связи.\n\n"
         "• <b>Поиск фото:</b> @nikitaGODai_bot pic <запрос>\n"
-        "• <b>Генерация артов:</b> @nikitaGODai_bot нарисуй <запрос>\n"
+        "• <b>Генерация картинок:</b> @nikitaGODai_bot нарисуй <запрос>\n"
         "• <b>Тексты треков:</b> 'текст песни <название>'\n"
         "• <b>Лимиты:</b> /limit"
     )
@@ -284,7 +284,7 @@ async def photo_handler(message: types.Message):
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=[
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 caption,
@@ -408,7 +408,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот перезапущен без банов DuckDuckGo!", flush=True)
+    print("Бот запущен на актуальных моделях Gemini 3.6 / 3.5!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
