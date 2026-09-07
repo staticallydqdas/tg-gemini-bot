@@ -36,13 +36,13 @@ except ImportError:
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Необязательно: укажите ваш Telegram ID в Railway Variables
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Модели: 3.5-flash-lite первой в очереди, чтобы беречь суточный лимит
+# Актуальные модели (3.5-flash-lite первой для экономии квот)
 MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 DAILY_LIMIT = 1500
 
@@ -99,7 +99,6 @@ def track_usage():
     usage_stats["requests_today"] += 1
 
 async def log_user_action(user: types.User, text: str, mode: str = "ЛС"):
-    """Логирование запросов пользователей в консоль Railway и админу."""
     username = f"@{user.username}" if user.username else f"ID:{user.id}"
     print(f"[{mode}] {username} ({user.first_name}): {text}", flush=True)
 
@@ -115,7 +114,6 @@ async def log_user_action(user: types.User, text: str, mode: str = "ЛС"):
             pass
 
 def quick_translate_to_en(text: str) -> str:
-    """Быстрый перевод запроса через Google Translate API без расхода токенов Gemini."""
     if not any(ord(c) > 127 for c in text):
         return text
     try:
@@ -128,7 +126,6 @@ def quick_translate_to_en(text: str) -> str:
         return text
 
 def search_web_images(query: str, max_results: int = 8) -> list:
-    """Стабильный открытый поиск картинок через Wikimedia Commons."""
     items = []
     en_query = quick_translate_to_en(query)
 
@@ -166,7 +163,6 @@ def search_web_images(query: str, max_results: int = 8) -> list:
     return items
 
 def fetch_song_lyrics(query: str) -> str:
-    """Точный поиск реального текста песни через базу LRCLIB."""
     clean = query.lower()
     for word in ["найди", "дай", "текст песни", "слова песни", "lyrics", "песня", "песни", "текст"]:
         clean = clean.replace(word, " ")
@@ -191,7 +187,6 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск текстовой инфы."""
     if DDGS is None:
         return ""
     try:
@@ -206,19 +201,22 @@ def search_web(query: str, max_results: int = 3) -> str:
     return ""
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация ответов через Gemini с контролем квот."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
 
     if any(trigger in lower for trigger in SEARCH_TRIGGERS):
-        web_info = search_web(prompt)
-        if web_info:
-            final_prompt = (
-                f"Информация из сети:\n{web_info}\n\n"
-                f"На основе этих данных ответь на запрос пользователя: {prompt}"
-            )
+        try:
+            web_info = search_web(prompt)
+            if web_info:
+                final_prompt = (
+                    f"Информация из сети:\n{web_info}\n\n"
+                    f"На основе этих данных ответь на запрос пользователя: {prompt}"
+                )
+        except Exception as e:
+            print(f"Ошибка веб-поиска: {e}", flush=True)
 
+    last_error = ""
     for model_name in MODELS_POOL:
         try:
             response = ai_client.models.generate_content(
@@ -234,9 +232,13 @@ def ask_gemini(prompt: str) -> str:
             if response.text:
                 return response.text.strip()
         except Exception as e:
-            print(f"Ошибка модели {model_name}: {e}", flush=True)
+            last_error = str(e)
+            print(f"Ошибка модели {model_name}: {last_error}", flush=True)
             continue
-    return "Сервер временно перегружен запросами, попробуй через минуту."
+
+    if "429" in last_error or "RESOURCE_EXHAUSTED" in last_error:
+        return "Лимит бесплатных запросов у Google временно исчерпан."
+    return "Сервер временно перегружен, попробуй через минуту."
 
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
@@ -249,7 +251,7 @@ async def check_limits(message: types.Message):
     left = max(0, DAILY_LIMIT - spent)
 
     text = (
-        f"📊 <b>Статистика бесплатных запросов</b>\n\n"
+        f"📊 <b>Статистика запросов</b>\n\n"
         f"• Потрачено сегодня: <b>{spent}</b>\n"
         f"• Осталось: <b>{left}</b> из {DAILY_LIMIT}\n"
         f"• Сброс счетчика: полночь UTC"
@@ -271,25 +273,35 @@ async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
-    # Логируем входящее сообщение
     asyncio.create_task(log_user_action(message.from_user, text, "ЛС"))
 
+    # Поиск текста песни
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         status_msg = await message.reply("🎶 Ищу слова трека в базе...")
-        lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
-        if lyrics:
-            await status_msg.edit_text(lyrics, parse_mode="HTML")
-        else:
-            await status_msg.edit_text(
-                "Не нашел этот трек в базе. Попробуй написать так:\n"
-                "<code>текст Bladee Topman</code>",
-                parse_mode="HTML"
-            )
+        try:
+            lyrics = await asyncio.wait_for(asyncio.to_thread(fetch_song_lyrics, text), timeout=6.0)
+            if lyrics:
+                await status_msg.edit_text(lyrics, parse_mode="HTML")
+            else:
+                await status_msg.edit_text(
+                    "Не нашел этот трек в базе. Попробуй написать так:\n"
+                    "<code>текст Bladee Topman</code>",
+                    parse_mode="HTML"
+                )
+        except Exception:
+            await status_msg.edit_text("Не удалось быстро получить текст.")
         return
 
+    # Обычный диалог с Gemini
     status_msg = await message.reply("⏳ Соображаю...")
-    answer = await asyncio.to_thread(ask_gemini, text)
-    await status_msg.edit_text(answer)
+    try:
+        answer = await asyncio.wait_for(asyncio.to_thread(ask_gemini, text), timeout=14.0)
+        await status_msg.edit_text(answer[:4000])
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("Нейросеть долго отвечает, попробуй ещё разок.")
+    except Exception as e:
+        print(f"Ошибка редактирования: {e}", flush=True)
+        await status_msg.edit_text("Что-то пошло не так, повтори вопрос.")
 
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
@@ -306,29 +318,31 @@ async def photo_handler(message: types.Message):
     caption = message.caption.strip() if message.caption else "Что на этой картинке?"
 
     try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model="gemini-3.5-flash-lite",
-            contents=[
-                {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
-                caption,
-            ],
-            config={
-                "system_instruction": SYSTEM_INSTRUCTION,
-                "safety_settings": SAFETY_SETTINGS,
-                "temperature": 0.72,
-            }
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ai_client.models.generate_content,
+                model="gemini-3.5-flash-lite",
+                contents=[
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
+                    caption,
+                ],
+                config={
+                    "system_instruction": SYSTEM_INSTRUCTION,
+                    "safety_settings": SAFETY_SETTINGS,
+                    "temperature": 0.72,
+                }
+            ),
+            timeout=12.0
         )
         await status_msg.edit_text(response.text if response.text else "Не удалось разобрать картинку.")
     except Exception as e:
         print(f"Ошибка фото: {e}", flush=True)
-        await status_msg.edit_text("Что-то пошло не так при обработке фото.")
+        await status_msg.edit_text("Не получилось обработать фото, попробуй позже.")
 
 # ----------------- ИНЛАЙН РЕЖИМ -----------------
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
-    # Отсекаем короткие запросы, чтобы не жечь запросы на каждую букву
     if len(text) < 3:
         return
 
@@ -421,7 +435,7 @@ async def inline_handler(query: types.InlineQuery):
                 await query.answer([item], cache_time=60, is_personal=True)
                 return
 
-        # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI (таймаут 6.5 сек во избежание просрочки Telegram)
+        # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI
         answer = await asyncio.wait_for(
             asyncio.to_thread(ask_gemini, text),
             timeout=6.5
@@ -463,7 +477,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот успешно запущен: логирование активно, промпт обновлен!", flush=True)
+    print("Бот перезапущен на новом ключе! Все обработчики активны.", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
