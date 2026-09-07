@@ -18,11 +18,14 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Поиск DuckDuckGo (для поиска фактов в вебе и картинок)
+# Попытка импорта DDGS (оставляем только как вспомогательный веб-поиск)
 try:
     from duckduckgo_search import DDGS
 except ImportError:
-    DDGS = None
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        DDGS = None
 
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
@@ -33,7 +36,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
+MODELS_POOL = ["gemini-2.5-flash", "gemini-1.5-flash"]
 DAILY_LIMIT = 1500
 
 usage_stats = {
@@ -46,8 +49,7 @@ SYSTEM_INSTRUCTION = (
     "Общайся неформально, на равных, живым современным языком. "
     "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту. "
     "К пользователю относись тепло и по-дружески: не груби, не быкуй и не токсичь. "
-    "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам. "
-    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — давай ответы сразу."
+    "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам."
 )
 
 SAFETY_SETTINGS = [
@@ -80,71 +82,84 @@ def track_usage():
         usage_stats["requests_today"] = 0
     usage_stats["requests_today"] += 1
 
-def search_web_images(query: str, max_results: int = 8) -> list:
-    """Полноценный поиск картинок: DuckDuckGo + Wikimedia Fallback."""
-    items = []
-
-    # 1. Попытка через DuckDuckGo Images
-    if DDGS is not None:
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.images(query, max_results=max_results))
-                for r in results:
-                    img_url = r.get("image")
-                    thumb_url = r.get("thumbnail") or img_url
-                    if img_url and (img_url.startswith("http://") or img_url.startswith("https://")):
-                        items.append({
-                            "image": img_url,
-                            "thumb": thumb_url,
-                            "title": r.get("title", "Image")
-                        })
-                if items:
-                    return items
-        except Exception as e:
-            print(f"Сбой поиска DuckDuckGo: {e}", flush=True)
-
-    # 2. Надежный Fallback через Wikimedia Commons (не блокирует хостинги)
+def quick_translate_to_en(text: str) -> str:
+    """Быстрый бесплатный перевод запроса через Google Translate API."""
+    if not any(ord(c) > 127 for c in text):
+        return text
     try:
-        encoded_q = urllib.parse.quote(query)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(text)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return "".join([part[0] for part in data[0] if part[0]]).strip()
+    except Exception:
+        return text
+
+def search_web_images(query: str, max_results: int = 8) -> list:
+    """Стабильный поиск изображений через API без блокировок IP хостинга."""
+    items = []
+    en_query = quick_translate_to_en(query)
+    
+    # 1. Поиск через открытый Unsplash API (по англ. названию работает идеально)
+    try:
+        url = f"https://unsplash.com/napi/search/photos?query={urllib.parse.quote(en_query)}&per_page={max_results}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for photo in data.get("results", []):
+                urls = photo.get("urls", {})
+                img = urls.get("regular") or urls.get("small")
+                thumb = urls.get("small") or img
+                if img:
+                    items.append({
+                        "image": img,
+                        "thumb": thumb,
+                        "title": photo.get("alt_description") or query
+                    })
+        if items:
+            return items
+    except Exception as e:
+        print(f"Ошибка Unsplash: {e}", flush=True)
+
+    # 2. Fallback через Wikimedia Commons
+    try:
         wiki_url = (
             f"https://commons.wikimedia.org/w/api.php?action=query&generator=search"
-            f"&gsrnamespace=6&gsrsearch={encoded_q}&gsrlimit={max_results}"
+            f"&gsrnamespace=6&gsrsearch={urllib.parse.quote(en_query)}&gsrlimit={max_results}"
             f"&prop=imageinfo&iiprop=url&format=json"
         )
-        req = urllib.request.Request(wiki_url, headers={"User-Agent": "TelegramBotPic/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        req = urllib.request.Request(wiki_url, headers={"User-Agent": "BotImageSearch/2.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             pages = data.get("query", {}).get("pages", {})
-            for page_id, page_data in pages.items():
-                img_info = page_data.get("imageinfo", [{}])[0]
-                img_url = img_info.get("url")
-                if img_url and any(img_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+            for _, page in pages.items():
+                info = page.get("imageinfo", [{}])[0]
+                img = info.get("url")
+                if img and any(img.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
                     items.append({
-                        "image": img_url,
-                        "thumb": img_url,
-                        "title": page_data.get("title", "Image")
+                        "image": img,
+                        "thumb": img,
+                        "title": page.get("title", "Image")
                     })
     except Exception as e:
-        print(f"Сбой fallback-поиска: {e}", flush=True)
+        print(f"Ошибка Wikimedia: {e}", flush=True)
 
     return items
 
 def fetch_song_lyrics(query: str) -> str:
-    """Точный поиск текста песни через открытую базу LRCLIB."""
+    """Точный поиск текста через LRCLIB."""
     clean = query.lower()
     for word in ["найди", "дай", "текст песни", "слова песни", "lyrics", "песня", "песни", "текст"]:
         clean = clean.replace(word, " ")
     clean = clean.strip()
-    
     if not clean:
         return ""
 
     try:
-        encoded_q = urllib.parse.quote(clean)
-        url = f"https://lrclib.net/api/search?q={encoded_q}"
-        req = urllib.request.Request(url, headers={"User-Agent": "TelegramBotMusic/1.0"})
-        with urllib.request.urlopen(req, timeout=6) as response:
-            data = json.loads(response.read().decode())
+        url = f"https://lrclib.net/api/search?q={urllib.parse.quote(clean)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "TelegramMusicBot/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
             if data and isinstance(data, list):
                 for track in data:
                     lyrics = track.get("plainLyrics")
@@ -157,7 +172,6 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск информации в сети."""
     if DDGS is None:
         return ""
     try:
@@ -168,11 +182,10 @@ def search_web(query: str, max_results: int = 3) -> str:
         if results:
             return "\n\n".join(results)
     except Exception as e:
-        print(f"Ошибка поиска DuckDuckGo: {e}", flush=True)
+        print(f"Веб-поиск недоступен: {e}", flush=True)
     return ""
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация ответов через Gemini с автопоиском в вебе."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
@@ -181,7 +194,7 @@ def ask_gemini(prompt: str) -> str:
         web_info = search_web(prompt)
         if web_info:
             final_prompt = (
-                f"Информация из поисковой выдачи интернета:\n{web_info}\n\n"
+                f"Информация из сети:\n{web_info}\n\n"
                 f"На основе этих данных ответь на запрос пользователя: {prompt}"
             )
 
@@ -200,24 +213,12 @@ def ask_gemini(prompt: str) -> str:
             if response.text:
                 return response.text.strip()
         except Exception as e:
-            print(f"Ошибка {model_name}: {e}", flush=True)
+            print(f"Ошибка модели {model_name}: {e}", flush=True)
             continue
-    return "Сервер временно прилёг отдохнуть, попробуй через минуту."
+    return "Сервер временно перегружен, попробуй еще раз через минуту."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод промпта для генерации картинок."""
-    track_usage()
-    try:
-        res = ai_client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=f"Translate this image prompt into a detailed English prompt for text-to-image AI: {ru_prompt}. Return ONLY English text.",
-            config={"max_output_tokens": 70, "temperature": 0.2}
-        )
-        if res.text:
-            return res.text.strip().replace("\n", " ")
-    except Exception as e:
-        print(f"Ошибка перевода: {e}", flush=True)
-    return ru_prompt
+    return quick_translate_to_en(ru_prompt)
 
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
@@ -244,7 +245,6 @@ async def cmd_start(message: types.Message):
         "• <b>Поиск фото:</b> @nikitaGODai_bot pic <запрос>\n"
         "• <b>Генерация артов:</b> @nikitaGODai_bot нарисуй <запрос>\n"
         "• <b>Тексты треков:</b> 'текст песни <название>'\n"
-        "• <b>Поиск инфы:</b> напиши 'найди ...'\n"
         "• <b>Лимиты:</b> /limit"
     )
 
@@ -253,7 +253,6 @@ async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
-    # Запрос текстов песен в ЛС
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         status_msg = await message.reply("🎶 Ищу слова трека в базе...")
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
@@ -261,13 +260,12 @@ async def message_handler(message: types.Message):
             await status_msg.edit_text(lyrics, parse_mode="HTML")
         else:
             await status_msg.edit_text(
-                "Не нашел этот трек в базе. Попробуй формат:\n"
+                "Не нашел этот трек в базе. Попробуй написать так:\n"
                 "<code>текст Bladee Topman</code>", 
                 parse_mode="HTML"
             )
         return
 
-    # Обычный диалог с Gemini
     status_msg = await message.reply("⏳ Соображаю...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
@@ -281,12 +279,12 @@ async def photo_handler(message: types.Message):
     await bot.download(photo, destination=file_io)
     image_bytes = file_io.getvalue()
 
-    caption = message.caption.strip() if message.caption else "Что тут вообще происходит на изображении?"
+    caption = message.caption.strip() if message.caption else "Что на этой картинке?"
 
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model="gemini-3.5-flash-lite",
+            model="gemini-2.5-flash",
             contents=[
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 caption,
@@ -334,7 +332,7 @@ async def inline_handler(query: types.InlineQuery):
                             parse_mode="HTML",
                         )
                     )
-                await query.answer(items, cache_time=300, is_personal=True)
+                await query.answer(items, cache_time=120, is_personal=True)
                 return
             else:
                 q_id = hashlib.md5(f"err_{clean_query}".encode("utf-8")).hexdigest()
@@ -343,13 +341,13 @@ async def inline_handler(query: types.InlineQuery):
                     title="Картинки не найдены",
                     description="Попробуй изменить запрос",
                     input_message_content=InputTextMessageContent(
-                        message_text=f"По запросу '{clean_query}' ничего не нашлось.",
+                        message_text=f"По запросу '{clean_query}' картинок не нашлось.",
                     ),
                 )
                 await query.answer([item], cache_time=1, is_personal=True)
                 return
 
-    # 2. ГЕНЕРАЦИЯ АРТОВ ЧЕРЕЗ ИИ
+    # 2. ГЕНЕРАЦИЯ АРТОВ
     if any(lower.startswith(p) for p in ["нарисуй", "draw", "картинка"]):
         clean_prompt = text
         for p in ["нарисуй", "draw", "картинка"]:
@@ -357,7 +355,7 @@ async def inline_handler(query: types.InlineQuery):
                 clean_prompt = text[len(p):].strip()
                 break
 
-        en_prompt = await asyncio.to_thread(translate_prompt_to_en, clean_prompt)
+        en_prompt = quick_translate_to_en(clean_prompt)
         seed = random.randint(1, 999999)
         encoded = urllib.parse.quote(en_prompt)
         image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&nologo=true"
@@ -373,7 +371,7 @@ async def inline_handler(query: types.InlineQuery):
         await query.answer([item], cache_time=0, is_personal=True)
         return
 
-    # 3. ТЕКСТЫ ПЕСЕН В ИНЛАЙНЕ
+    # 3. ТЕКСТЫ ПЕСЕН
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
         if lyrics:
@@ -390,7 +388,7 @@ async def inline_handler(query: types.InlineQuery):
             await query.answer([item], cache_time=60, is_personal=True)
             return
 
-    # 4. ОТВЕТЫ GEMINI В ИНЛАЙНЕ
+    # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
@@ -410,7 +408,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов к работе: поиск картинок и текстов настроен!", flush=True)
+    print("Бот перезапущен без банов DuckDuckGo!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
