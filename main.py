@@ -24,9 +24,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Актуальные модели Gemini
-PRIMARY_MODEL = "gemini-3.6-flash"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# Модели с высоким бесплатным лимитом
+MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
 
 SYSTEM_INSTRUCTION = (
     "Ты — дворовый, максимально циничный, угарный и дерзкий кент. "
@@ -56,15 +55,15 @@ SAFETY_SETTINGS = [
 ]
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация текста с актуальными моделями."""
-    for model_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
+    """Генерация текста с обходом квоты 429."""
+    for model_name in MODELS_POOL:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
                 contents=prompt,
                 config={
                     "system_instruction": SYSTEM_INSTRUCTION,
-                    "max_output_tokens": 600,
+                    "max_output_tokens": 500,
                     "temperature": 0.95,
                     "safety_settings": SAFETY_SETTINGS,
                 },
@@ -74,47 +73,47 @@ def ask_gemini(prompt: str) -> str:
         except Exception as e:
             print(f"Ошибка {model_name}: {e}", flush=True)
             continue
-    return "Пиздец какой-то с сервером, не могу сейчас ответить."
+    return "Пиздец, лимиты бесплатного API временно забиты. Обожди минуту."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод промпта через быструю lite-модель."""
+    """Быстрый перевод промпта без расхода квоты."""
     try:
         res = ai_client.models.generate_content(
-            model=FALLBACK_MODEL,
-            contents=f"Translate this image prompt into a detailed English prompt for text-to-image AI: {ru_prompt}. Output ONLY the prompt in English.",
-            config={"max_output_tokens": 80, "temperature": 0.2}
+            model="gemini-3.5-flash-lite",
+            contents=f"Translate this image prompt into a detailed English prompt for Stable Diffusion: {ru_prompt}. Return ONLY English text.",
+            config={"max_output_tokens": 60, "temperature": 0.2}
         )
         if res.text:
             return res.text.strip().replace("\n", " ")
     except Exception as e:
-        print(f"Ошибка перевода промпта: {e}", flush=True)
+        print(f"Ошибка перевода: {e}", flush=True)
     return ru_prompt
 
 @dp.message(F.text.in_({"/start", "/reset"}))
 async def cmd_start(message: types.Message):
-    await message.reply("Здорово, ебать. Чё надо? Спрашивай или кидай фото, разберемся без цензуры.")
+    await message.reply("Здорово, ебать. Спрашивай чё надо, кидай фото или используй инлайн.")
 
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     text = message.text.strip()
-    status_msg = await message.reply("⏳ Ща соображу нахуй...")
+    status_msg = await message.reply("⏳ Ща соображу...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
-    status_msg = await message.reply("🔍 Гляжу чё там за дичь...")
+    status_msg = await message.reply("🔍 Гляжу чё там...")
     photo = message.photo[-1]
     file_io = io.BytesIO()
     await bot.download(photo, destination=file_io)
     image_bytes = file_io.getvalue()
 
-    caption = message.caption.strip() if message.caption else "Поясни с матом, чё тут за хуйня происходит на фотке."
+    caption = message.caption.strip() if message.caption else "Поясни с матом, чё тут за хрень на фото."
 
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model=PRIMARY_MODEL,
+            model="gemini-3.5-flash-lite",
             contents=[
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 caption,
@@ -125,20 +124,21 @@ async def photo_handler(message: types.Message):
                 "temperature": 0.95,
             }
         )
-        await status_msg.edit_text(response.text if response.text else "Пиздец, не понял чё на фото.")
+        await status_msg.edit_text(response.text if response.text else "Хуйня какая-то, не разобрал фото.")
     except Exception as e:
         print(f"Ошибка фото: {e}", flush=True)
-        await status_msg.edit_text("Не удалось прогрузить эту хрень.")
+        await status_msg.edit_text("Не удалось разобрать картинку, лимит или сбой.")
 
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
-    if len(text) < 2:
+    if len(text) < 3:
         return
 
     lower = text.lower()
 
-    if any(lower.startswith(prefix) for prefix in ["нарисуй", "фото", "картинка", "draw"]):
+    # Генерация изображений
+    if any(lower.startswith(p) for p in ["нарисуй", "фото", "картинка", "draw"]):
         clean_prompt = text
         for p in ["нарисуй", "фото", "картинка", "draw"]:
             if lower.startswith(p):
@@ -162,6 +162,7 @@ async def inline_handler(query: types.InlineQuery):
         await query.answer([item], cache_time=0, is_personal=True)
         return
 
+    # Текстовые ответы (кэш 60 секунд экономит запросы)
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
@@ -176,12 +177,12 @@ async def inline_handler(query: types.InlineQuery):
             parse_mode="HTML",
         ),
     )
-    await query.answer([item], cache_time=10, is_personal=True)
+    await query.answer([item], cache_time=60, is_personal=True)
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов к работе на актуальных моделях!", flush=True)
+    print("Бот переключен на lite-модели и готов!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
