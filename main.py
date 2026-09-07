@@ -8,7 +8,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
 from google import genai
 
-# Отключаем лишний шум библиотек в логах
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -19,7 +18,6 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def ask_gemini(text: str) -> str:
-    # Рабочие названия моделей в v1beta с высоким бесплатным суточным лимитом
     for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
         try:
             response = ai_client.models.generate_content(
@@ -37,7 +35,6 @@ def ask_gemini(text: str) -> str:
             continue
     return "Не удалось получить ответ, попробуйте позже."
 
-# Ответ в личных сообщениях боту
 @dp.message()
 async def message_handler(message: types.Message):
     if not message.text:
@@ -47,7 +44,6 @@ async def message_handler(message: types.Message):
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
-# Инлайн-режим: моментальная выдача карточки без задержки Telegram
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -64,17 +60,18 @@ async def inline_handler(query: types.InlineQuery):
         input_message_content=InputTextMessageContent(
             message_text=f"❓ <b>{escaped_q}</b>\n\n<i>⏳ Нейросеть генерирует ответ...</i>",
             parse_mode="HTML"
-        )
+        ),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[])
     )
     await query.answer([item], cache_time=1, is_personal=True)
 
-# Событие после отправки карточки: обновление текста на сгенерированный ответ
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
     text = chosen_result.query.strip()
     print(f"-> Клик получен: {text}")
 
     if not chosen_result.inline_message_id:
+        print("Ошибка: inline_message_id отсутствует")
         return
 
     escaped_q = html.escape(text)
@@ -86,9 +83,9 @@ async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
             text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
             parse_mode="HTML"
         )
-        print("<- Сообщение успешно обновлено")
+        print("<- Сообщение в инлайне успешно обновлено")
     except Exception as e:
-        print(f"Ошибка при обновлении: {e}")
+        print(f"Ошибка edit_message_text: {e}")
         traceback.print_exc()
 
 async def main():
