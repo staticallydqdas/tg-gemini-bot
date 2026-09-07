@@ -36,12 +36,13 @@ except ImportError:
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_ID = os.getenv("ADMIN_ID")  # Необязательно: укажите ваш Telegram ID в Railway Variables
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Актуальные модели: 3.5-flash-lite первой в очереди, чтобы не тратить суточный лимит 3.6-flash
+# Модели: 3.5-flash-lite первой в очереди, чтобы беречь суточный лимит
 MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 DAILY_LIMIT = 1500
 
@@ -97,8 +98,24 @@ def track_usage():
         usage_stats["requests_today"] = 0
     usage_stats["requests_today"] += 1
 
+async def log_user_action(user: types.User, text: str, mode: str = "ЛС"):
+    """Логирование запросов пользователей в консоль Railway и админу."""
+    username = f"@{user.username}" if user.username else f"ID:{user.id}"
+    print(f"[{mode}] {username} ({user.first_name}): {text}", flush=True)
+
+    if ADMIN_ID and str(user.id) != str(ADMIN_ID):
+        try:
+            log_msg = (
+                f"👤 <b>Запрос ({mode})</b>\n"
+                f"От: {html.escape(user.first_name)} ({username})\n"
+                f"Текст: <code>{html.escape(text[:300])}</code>"
+            )
+            await bot.send_message(chat_id=int(ADMIN_ID), text=log_msg, parse_mode="HTML")
+        except Exception:
+            pass
+
 def quick_translate_to_en(text: str) -> str:
-    """Быстрый перевод запроса через Google Translate API для качественного поиска фото."""
+    """Быстрый перевод запроса через Google Translate API без расхода токенов Gemini."""
     if not any(ord(c) > 127 for c in text):
         return text
     try:
@@ -174,7 +191,7 @@ def fetch_song_lyrics(query: str) -> str:
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск информации в сети."""
+    """Поиск текстовой инфы."""
     if DDGS is None:
         return ""
     try:
@@ -254,6 +271,9 @@ async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
+    # Логируем входящее сообщение
+    asyncio.create_task(log_user_action(message.from_user, text, "ЛС"))
+
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         status_msg = await message.reply("🎶 Ищу слова трека в базе...")
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
@@ -274,6 +294,9 @@ async def message_handler(message: types.Message):
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     track_usage()
+    caption_log = message.caption if message.caption else "[ФОТО БЕЗ ТЕКСТА]"
+    asyncio.create_task(log_user_action(message.from_user, caption_log, "ФОТО"))
+
     status_msg = await message.reply("🔍 Смотрю, что тут...")
     photo = message.photo[-1]
     file_io = io.BytesIO()
@@ -305,9 +328,11 @@ async def photo_handler(message: types.Message):
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
-    if len(text) < 2:
+    # Отсекаем короткие запросы, чтобы не жечь запросы на каждую букву
+    if len(text) < 3:
         return
 
+    asyncio.create_task(log_user_action(query.from_user, text, "INLINE"))
     lower = text.lower()
 
     try:
@@ -396,7 +421,7 @@ async def inline_handler(query: types.InlineQuery):
                 await query.answer([item], cache_time=60, is_personal=True)
                 return
 
-        # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI (с таймаутом до 6.5 секунд)
+        # 4. ТЕКСТОВЫЕ ОТВЕТЫ GEMINI (таймаут 6.5 сек во избежание просрочки Telegram)
         answer = await asyncio.wait_for(
             asyncio.to_thread(ask_gemini, text),
             timeout=6.5
@@ -438,7 +463,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот успешно запущен на Gemini 3.5 / 3.6!", flush=True)
+    print("Бот успешно запущен: логирование активно, промпт обновлен!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
