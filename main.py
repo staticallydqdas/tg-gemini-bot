@@ -6,12 +6,14 @@ import logging
 import os
 import random
 import urllib.parse
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import (
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
     InputTextMessageContent,
 )
+from duckduckgo_search import DDGS
 from google import genai
 from google.genai import types as genai_types
 
@@ -24,15 +26,19 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Пул моделей с высоким лимитом
 MODELS_POOL = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
+DAILY_LIMIT = 1500
 
-# Сбалансированный характер: свойский, живой, без необоснованной агрессии
+# Внутренний трекер суточного лимита
+usage_stats = {
+    "current_date": datetime.now(timezone.utc).date(),
+    "requests_today": 0,
+}
+
 SYSTEM_INSTRUCTION = (
     "Ты — остроумный, прямой и свойский товарищ с отличным чувством юмора. "
     "Общайся неформально, на равных, живым современным языком. "
-    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту и подчеркивает мысль. "
-    "Не пытайся вставлять ругательства в каждое предложение ради галочки. "
+    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту. "
     "К пользователю относись тепло и по-дружески: не груби, не быкуй и не токсичь. "
     "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам."
 )
@@ -56,16 +62,52 @@ SAFETY_SETTINGS = [
     ),
 ]
 
+SEARCH_TRIGGERS = ("найди", "поищи", "поиск", "гугл", "текст песни", "слова песни", "аккорды", "новости")
+
+def track_usage():
+    """Учет расхода запросов с автосбросом в полночь UTC."""
+    today = datetime.now(timezone.utc).date()
+    if usage_stats["current_date"] != today:
+        usage_stats["current_date"] = today
+        usage_stats["requests_today"] = 0
+    usage_stats["requests_today"] += 1
+
+def search_web(query: str, max_results: int = 3) -> str:
+    """Бесплатный поиск в DuckDuckGo без лимитов Google."""
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append(f"— {r.get('title', '')}: {r.get('body', '')}")
+        if results:
+            return "\n\n".join(results)
+    except Exception as e:
+        print(f"Ошибка поиска DuckDuckGo: {e}", flush=True)
+    return ""
+
 def ask_gemini(prompt: str) -> str:
-    """Генерация ответа в дружеском и живом стиле."""
+    """Генерация текста с интеграцией поиска DuckDuckGo."""
+    track_usage()
+    lower = prompt.lower()
+    
+    final_prompt = prompt
+    # Если запрос требует поиска в сети
+    if any(trigger in lower for trigger in SEARCH_TRIGGERS):
+        web_info = search_web(prompt)
+        if web_info:
+            final_prompt = (
+                f"Информация из поисковой выдачи интернета:\n{web_info}\n\n"
+                f"На основе этих данных ответь на запрос пользователя: {prompt}"
+            )
+
     for model_name in MODELS_POOL:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
-                contents=prompt,
+                contents=final_prompt,
                 config={
                     "system_instruction": SYSTEM_INSTRUCTION,
-                    "max_output_tokens": 550,
+                    "max_output_tokens": 700,
                     "temperature": 0.72,
                     "safety_settings": SAFETY_SETTINGS,
                 },
@@ -78,7 +120,8 @@ def ask_gemini(prompt: str) -> str:
     return "Сервер временно прилёг отдохнуть, попробуй через минуту."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод промпта для генератора изображений."""
+    """Перевод промпта для генератора картинок."""
+    track_usage()
     try:
         res = ai_client.models.generate_content(
             model="gemini-3.5-flash-lite",
@@ -91,19 +134,48 @@ def translate_prompt_to_en(ru_prompt: str) -> str:
         print(f"Ошибка перевода: {e}", flush=True)
     return ru_prompt
 
+# 1. Проверка лимитов
+@dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
+async def check_limits(message: types.Message):
+    today = datetime.now(timezone.utc).date()
+    if usage_stats["current_date"] != today:
+        usage_stats["current_date"] = today
+        usage_stats["requests_today"] = 0
+
+    spent = usage_stats["requests_today"]
+    left = max(0, DAILY_LIMIT - spent)
+    
+    text = (
+        f"📊 <b>Статистика бесплатных запросов</b>\n\n"
+        f"• Потрачено сегодня: <b>{spent}</b>\n"
+        f"• Осталось: <b>{left}</b> из {DAILY_LIMIT}\n"
+        f"• Сброс счетчика: в полночь по UTC (~10:00-11:00 МСК)"
+    )
+    await message.reply(text, parse_mode="HTML")
+
+# 2. Старт / Сброс
 @dp.message(F.text.in_({"/start", "/reset"}))
 async def cmd_start(message: types.Message):
-    await message.reply("Привет! На связи. Задавай вопросы, кидай скрины или зови меня через инлайн.")
+    await message.reply(
+        "Привет! Я на связи.\n"
+        "• Задавай любые вопросы или проси найти инфу в сети (слова 'найди', 'текст песни').\n"
+        "• Кидай фото для анализа.\n"
+        "• Проверяй остаток квоты командой /limit.\n"
+        "• Используй инлайн в любых чатах: @nikitaGODai_bot нарисуй ..."
+    )
 
+# 3. Текстовые сообщения в ЛС
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     text = message.text.strip()
-    status_msg = await message.reply("⏳ Думаю...")
+    status_msg = await message.reply("⏳ Ищу и соображаю...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
+# 4. Анализ фото в ЛС
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
+    track_usage()
     status_msg = await message.reply("🔍 Смотрю, что тут...")
     photo = message.photo[-1]
     file_io = io.BytesIO()
@@ -131,6 +203,7 @@ async def photo_handler(message: types.Message):
         print(f"Ошибка фото: {e}", flush=True)
         await status_msg.edit_text("Что-то пошло не так при загрузке фото.")
 
+# 5. Инлайн-режим
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -164,7 +237,7 @@ async def inline_handler(query: types.InlineQuery):
         await query.answer([item], cache_time=0, is_personal=True)
         return
 
-    # Текстовые ответы
+    # Текстовые ответы (с поиском, если есть триггеры)
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
@@ -175,7 +248,7 @@ async def inline_handler(query: types.InlineQuery):
         title=f"Ответ: {text[:35]}",
         description=answer[:80],
         input_message_content=InputTextMessageContent(
-            message_text=f"🐏 <b>{escaped_q}</b>\n\n{escaped_a}",
+            message_text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
             parse_mode="HTML",
         ),
     )
@@ -184,7 +257,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот готов к работе в сбалансированном режиме!", flush=True)
+    print("Бот успешно запущен с веб-поиском и счетчиком лимита!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
