@@ -22,6 +22,9 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Хранилище запросов, чтобы бот помнил, о чем вопрос
+cache_prompts = {}
+
 def ask_gemini(text: str) -> str:
     for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
         try:
@@ -40,7 +43,6 @@ def ask_gemini(text: str) -> str:
             continue
     return "Не удалось получить ответ, попробуйте позже."
 
-# Ответ в личном чате с ботом
 @dp.message()
 async def message_handler(message: types.Message):
     if not message.text:
@@ -49,71 +51,67 @@ async def message_handler(message: types.Message):
     answer = await asyncio.to_thread(ask_gemini, message.text.strip())
     await status_msg.edit_text(answer)
 
-# Инлайн-режим: моментальный показ карточки без ожидания нейросети
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
     if len(text) < 2:
         return
 
-    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+    q_id = hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+    cache_prompts[q_id] = text
     escaped_q = html.escape(text)
 
-    # Временная кнопка-статус: заставляет Telegram передать inline_message_id
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ ИИ генерирует ответ...", callback_data="wait")]
+            [InlineKeyboardButton(text="⏳ Получить ответ...", callback_data=f"ai:{q_id}")]
         ]
     )
 
     item = InlineQueryResultArticle(
         id=q_id,
         title=f"Спросить: {text[:50]}",
-        description="Нажмите, чтобы отправить запрос нейросети",
+        description="Отправить в чат и получить ответ ИИ",
         input_message_content=InputTextMessageContent(
             message_text=f"❓ <b>{escaped_q}</b>\n\n<i>⏳ Нейросеть генерирует ответ...</i>",
             parse_mode="HTML",
         ),
         reply_markup=kb,
     )
-    # cache_time=1 заставляет Telegram сразу регистрировать клик
-    await query.answer([item], cache_time=1, is_personal=True)
+    await query.answer([item], cache_time=0, is_personal=True)
 
-# Фоновая задача генерации и замены текста
-async def generate_and_edit(inline_message_id: str, text: str):
-    escaped_q = html.escape(text)
+# Функция редактирования сообщения в чате
+async def update_inline(inline_msg_id: str, prompt: str):
+    escaped_q = html.escape(prompt)
     try:
-        answer = await asyncio.to_thread(ask_gemini, text)
+        answer = await asyncio.to_thread(ask_gemini, prompt)
         escaped_a = html.escape(answer)
-        # Меняем текст на ответ и удаляем кнопку ожидания
         await bot.edit_message_text(
-            inline_message_id=inline_message_id,
+            inline_message_id=inline_msg_id,
             text=f"❓ <b>{escaped_q}</b>\n\n{escaped_a}",
             parse_mode="HTML",
             reply_markup=None,
         )
-        print(f"<- Сообщение успешно обновлено для: {text[:30]}")
+        print(f"<- Сообщение успешно обновлено: {prompt[:30]}")
     except Exception as e:
-        print(f"Ошибка при обновлении инлайна: {e}")
+        print(f"Ошибка обновления: {e}")
         traceback.print_exc()
 
-# Автоматически вызывается Telegram в момент отправки сообщения в чат
+# 1. Автоматический вариант (если Telegram передал chosen_inline_result)
 @dp.chosen_inline_result()
 async def on_chosen_inline_result(chosen_result: types.ChosenInlineResult):
     text = chosen_result.query.strip()
-    print(f"-> Клик по карточке: {text}")
+    print(f"-> Telegram прислал chosen_inline: {text}")
+    if chosen_result.inline_message_id:
+        asyncio.create_task(update_inline(chosen_result.inline_message_id, text))
 
-    if not chosen_result.inline_message_id:
-        print("Ошибка: inline_message_id отсутствует")
-        return
-
-    # Запускаем генерацию в фоне, не блокируя бота
-    asyncio.create_task(generate_and_edit(chosen_result.inline_message_id, text))
-
-# Заглушка, если кто-то нажмет на кнопку во время генерации
-@dp.callback_query()
-async def callback_ignore(callback: types.CallbackQuery):
-    await callback.answer("⏳ Ответ генерируется, подождите...")
+# 2. Мгновенный ручной вариант по клику на кнопку (если chosen_inline не пришел)
+@dp.callback_query(lambda c: c.data and c.data.startswith("ai:"))
+async def on_click(callback: types.CallbackQuery):
+    await callback.answer("⏳ Генерирую...")
+    q_id = callback.data.split(":")[1]
+    prompt = cache_prompts.get(q_id, "Запрос")
+    if callback.inline_message_id:
+        asyncio.create_task(update_inline(callback.inline_message_id, prompt))
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
