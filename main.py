@@ -18,7 +18,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
-# Безопасный импорт DuckDuckGo
+# Поиск DuckDuckGo (для поиска фактов в вебе)
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -28,6 +28,10 @@ logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Переменные для поиска картинок через Google
+GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY")
+GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -44,11 +48,10 @@ usage_stats = {
 SYSTEM_INSTRUCTION = (
     "Ты — остроумный, прямой и свойский товарищ с отличным чувством юмора. "
     "Общайся неформально, на равных, живым современным языком. "
-    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту и подчеркивает мысль. "
-    "Не пытайся вставлять ругательства в каждое предложение ради галочки. "
+    "Мат используй только для эмоций, удачной шутки или связки слов, когда это реально к месту. "
     "К пользователю относись тепло и по-дружески: не груби, не быкуй и не токсичь. "
     "Отвечай емко, без лишней воды и духоты, но действительно полезно и по фактам. "
-    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — выдавай информацию прямо в ответ."
+    "Никогда не отправляй пользователя искать что-то в Google или на сторонние сайты — давай ответы сразу."
 )
 
 SAFETY_SETTINGS = [
@@ -72,17 +75,48 @@ SAFETY_SETTINGS = [
 
 SEARCH_TRIGGERS = ("найди", "поищи", "поиск", "гугл", "аккорды", "новости")
 LYRICS_TRIGGERS = ("текст песни", "слова песни", "lyrics", "текст ")
+PIC_TRIGGERS = ("pic", "пик", "найди фото", "фото")
 
 def track_usage():
-    """Счетчик запросов с автосбросом в полночь UTC."""
     today = datetime.now(timezone.utc).date()
     if usage_stats["current_date"] != today:
         usage_stats["current_date"] = today
         usage_stats["requests_today"] = 0
     usage_stats["requests_today"] += 1
 
+def search_google_images(query: str, num: int = 8) -> list:
+    """Поиск картинок напрямую через Google Custom Search API."""
+    if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
+        print("Ошибка: переменные GOOGLE_SEARCH_KEY или GOOGLE_SEARCH_CX не заданы!", flush=True)
+        return []
+    
+    encoded_q = urllib.parse.quote(query)
+    url = (
+        f"https://www.googleapis.com/customsearch/v1"
+        f"?key={GOOGLE_SEARCH_KEY}&cx={GOOGLE_SEARCH_CX}&q={encoded_q}&searchType=image&num={num}"
+    )
+    
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            items = []
+            for item in data.get("items", []):
+                img_url = item.get("link")
+                thumb_url = item.get("image", {}).get("thumbnailLink") or img_url
+                if img_url:
+                    items.append({
+                        "image": img_url,
+                        "thumb": thumb_url,
+                        "title": item.get("title", "Google Image")
+                    })
+            return items
+    except Exception as e:
+        print(f"Ошибка Google Images API: {e}", flush=True)
+    return []
+
 def fetch_song_lyrics(query: str) -> str:
-    """Прямой и стабильный поиск реального текста песни через LRCLIB API."""
+    """Прямой и стабильный поиск текста трека через LRCLIB."""
     clean = query.lower()
     for word in ["найди", "дай", "текст песни", "слова песни", "lyrics", "песня", "песни", "текст"]:
         clean = clean.replace(word, " ")
@@ -94,10 +128,7 @@ def fetch_song_lyrics(query: str) -> str:
     try:
         encoded_q = urllib.parse.quote(clean)
         url = f"https://lrclib.net/api/search?q={encoded_q}"
-        req = urllib.request.Request(
-            url, 
-            headers={"User-Agent": "TelegramBotMusic/1.0"}
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "TelegramBotMusic/1.0"})
         with urllib.request.urlopen(req, timeout=6) as response:
             data = json.loads(response.read().decode())
             if data and isinstance(data, list):
@@ -106,15 +137,12 @@ def fetch_song_lyrics(query: str) -> str:
                     if lyrics:
                         title = track.get("trackName", "Трек")
                         artist = track.get("artistName", "Исполнитель")
-                        # Ограничение длины под лимиты одного сообщения Telegram (4096 символов)
                         return f"🎶 <b>{html.escape(artist)} — {html.escape(title)}</b>\n\n{html.escape(lyrics[:3800])}"
     except Exception as e:
-        print(f"Ошибка получения текста с LRCLIB: {e}", flush=True)
-
+        print(f"Ошибка получения текста: {e}", flush=True)
     return ""
 
 def search_web(query: str, max_results: int = 3) -> str:
-    """Поиск инфы через DuckDuckGo."""
     if DDGS is None:
         return ""
     try:
@@ -125,11 +153,10 @@ def search_web(query: str, max_results: int = 3) -> str:
         if results:
             return "\n\n".join(results)
     except Exception as e:
-        print(f"Ошибка поиска DuckDuckGo: {e}", flush=True)
+        print(f"Ошибка DuckDuckGo: {e}", flush=True)
     return ""
 
 def ask_gemini(prompt: str) -> str:
-    """Генерация текстового ответа."""
     track_usage()
     lower = prompt.lower()
     final_prompt = prompt
@@ -162,7 +189,6 @@ def ask_gemini(prompt: str) -> str:
     return "Сервер временно прилёг отдохнуть, попробуй через минуту."
 
 def translate_prompt_to_en(ru_prompt: str) -> str:
-    """Перевод промпта для генератора картинок."""
     track_usage()
     try:
         res = ai_client.models.generate_content(
@@ -176,7 +202,6 @@ def translate_prompt_to_en(ru_prompt: str) -> str:
         print(f"Ошибка перевода: {e}", flush=True)
     return ru_prompt
 
-# 1. Проверка лимитов
 @dp.message(F.text.in_({"/limit", "/stats", "/лимит"}))
 async def check_limits(message: types.Message):
     today = datetime.now(timezone.utc).date()
@@ -195,24 +220,23 @@ async def check_limits(message: types.Message):
     )
     await message.reply(text, parse_mode="HTML")
 
-# 2. Старт
 @dp.message(F.text.in_({"/start", "/reset"}))
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 Здорово! Я на связи.\n\n"
+        "• <b>Поиск картинок (Google):</b> @nikitaGODai_bot pic <запрос>\n"
+        "• <b>Генерация картинок:</b> @nikitaGODai_bot нарисуй <запрос>\n"
         "• <b>Тексты треков:</b> 'текст песни <название>'\n"
         "• <b>Поиск инфы:</b> напиши 'найди ...'\n"
-        "• <b>Генерация картинок в инлайне:</b> @nikitaGODai_bot нарисуй ...\n"
         "• <b>Лимиты:</b> /limit"
     )
 
-# 3. Обработка текстовых сообщений в ЛС
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     text = message.text.strip()
     lower = text.lower()
 
-    # Перехват запросов на тексты песен
+    # Перехват текстов песен (изолировано от Gemini)
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         status_msg = await message.reply("🎶 Ищу слова трека в базе...")
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
@@ -220,18 +244,17 @@ async def message_handler(message: types.Message):
             await status_msg.edit_text(lyrics, parse_mode="HTML")
         else:
             await status_msg.edit_text(
-                "Не нашел этот трек в базе. Попробуй написать в формате:\n"
+                "Не нашел этот трек в базе. Попробуй написать так:\n"
                 "<code>текст Bladee Topman</code>", 
                 parse_mode="HTML"
             )
-        return  # Блокируем передачу запроса в Gemini!
+        return
 
     # Обычный диалог с Gemini
     status_msg = await message.reply("⏳ Соображаю...")
     answer = await asyncio.to_thread(ask_gemini, text)
     await status_msg.edit_text(answer)
 
-# 4. Анализ фото в ЛС
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     track_usage()
@@ -262,7 +285,7 @@ async def photo_handler(message: types.Message):
         print(f"Ошибка фото: {e}", flush=True)
         await status_msg.edit_text("Что-то пошло не так при обработке фото.")
 
-# 5. Инлайн-режим
+# ----------------- ИНЛАЙН РЕЖИМ -----------------
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
     text = query.query.strip()
@@ -271,10 +294,36 @@ async def inline_handler(query: types.InlineQuery):
 
     lower = text.lower()
 
-    # Генерация картинок
-    if any(lower.startswith(p) for p in ["нарисуй", "фото", "картинка", "draw"]):
+    # 1. GOOGLE КАРТИНКИ (АНАЛОГ @PIC)
+    if any(lower.startswith(p) for p in PIC_TRIGGERS):
+        clean_query = text
+        for p in PIC_TRIGGERS:
+            if lower.startswith(p):
+                clean_query = text[len(p):].strip()
+                break
+
+        if clean_query:
+            images = await asyncio.to_thread(search_google_images, clean_query)
+            if images:
+                items = []
+                for idx, img in enumerate(images):
+                    q_id = hashlib.md5(f"gpic_{clean_query}_{idx}".encode("utf-8")).hexdigest()
+                    items.append(
+                        InlineQueryResultPhoto(
+                            id=q_id,
+                            photo_url=img["image"],
+                            thumbnail_url=img["thumb"],
+                            caption=f"🔍 <b>Google Картинки:</b> {html.escape(clean_query)}",
+                            parse_mode="HTML",
+                        )
+                    )
+                await query.answer(items, cache_time=300, is_personal=True)
+                return
+
+    # 2. ГЕНЕРАЦИЯ АРТОВ ЧЕРЕЗ ИИ
+    if any(lower.startswith(p) for p in ["нарисуй", "draw", "картинка"]):
         clean_prompt = text
-        for p in ["нарисуй", "фото", "картинка", "draw"]:
+        for p in ["нарисуй", "draw", "картинка"]:
             if lower.startswith(p):
                 clean_prompt = text[len(p):].strip()
                 break
@@ -295,7 +344,7 @@ async def inline_handler(query: types.InlineQuery):
         await query.answer([item], cache_time=0, is_personal=True)
         return
 
-    # Тексты песен в инлайне
+    # 3. ТЕКСТЫ ПЕСЕН В ИНЛАЙНЕ
     if any(trig in lower for trig in LYRICS_TRIGGERS):
         lyrics = await asyncio.to_thread(fetch_song_lyrics, text)
         if lyrics:
@@ -312,7 +361,7 @@ async def inline_handler(query: types.InlineQuery):
             await query.answer([item], cache_time=60, is_personal=True)
             return
 
-    # Ответы через Gemini в инлайне
+    # 4. ОБЫЧНЫЕ ТЕКСТОВЫЕ ОТВЕТЫ GEMINI
     q_id = hashlib.md5(text.encode("utf-8")).hexdigest()
     answer = await asyncio.to_thread(ask_gemini, text)
     escaped_q = html.escape(text)
@@ -332,7 +381,7 @@ async def inline_handler(query: types.InlineQuery):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    print("Бот запущен с прямой базой текстов треков!", flush=True)
+    print("Бот готов к работе!", flush=True)
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 if __name__ == "__main__":
