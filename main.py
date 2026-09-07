@@ -17,9 +17,9 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 def ask_gemini(text: str) -> str:
     response = ai_client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=text
+        contents=f"Ответь кратко и емко (1-2 предложения): {text}"
     )
-    return response.text or "Пустой ответ."
+    return response.text or "Ответ не сформирован."
 
 @dp.inline_query()
 async def inline_handler(query: types.InlineQuery):
